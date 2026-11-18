@@ -1,0 +1,51 @@
+# Example mono-release.yaml for a monorepo of microservices.
+# Place it in the repository root. Check the result with `monorelease plan`.
+
+# Version of the first release of a component that has no tags yet (default 1.0.0).
+initial_version: 1.0.0
+
+# Release branches (optional). Without this block every branch releases stable versions.
+# If the block is set and the current branch is not listed, commands stop with an error.
+branches:
+  - name: main                 # stable releases: 1.4.0
+  - name: beta                 # pre-releases: 1.5.0-beta.1, 1.5.0-beta.2, ...
+    prerelease: beta
+  - name: "rc/*"               # names may be globs
+    prerelease: rc
+
+# Components. Names must not contain '@', '/' or whitespace; the tag is <name>@<version>.
+components:
+  common-lib:                  # shared library that the services depend on
+    paths:
+      - libs/common/**
+
+  orders:
+    paths:                     # a component may be spread over several directories
+      - services/orders/**
+      - shared/proto/orders/**
+    exclude:                   # changes that do not affect the component
+      - "**/*.md"
+    depends_on: [common-lib]   # releasing common-lib also releases orders
+    # cascade is not set: defaults to patch
+
+  billing:
+    paths:
+      - services/billing/**
+    depends_on: [common-lib]
+    cascade: minor             # a dependency release bumps minor
+
+  notifications:
+    paths:
+      - services/notifications/**
+    depends_on: [common-lib]
+    cascade: none              # a dependency release does not affect this service
+
+# Umbrellas: a versioned set of components. The member versions are stored in the
+# message of the <name>@<version> tag. Released when at least one member is released.
+umbrellas:
+  platform:
+    all: true                  # every component in the repository, including ones added later
+
+  # the same with an explicit list:
+  # core:
+  #   members: [orders, billing, common-lib]

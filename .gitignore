@@ -1,0 +1,13 @@
+# Internal design notes: not published
+DESIGN.md
+
+# Build output
+/monorelease
+/monorelease-*
+/bin/
+*.test
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

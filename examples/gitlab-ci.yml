@@ -1,0 +1,22 @@
+# Example: releasing versions from GitLab CI.
+# Needs a token that can push to the repository, stored in the CI/CD variable
+# MONO_RELEASE_PUSH_TOKEN (scope: write_repository).
+
+stages: [release]
+
+release:
+  stage: release
+  image: golang:1.27           # or an image that already contains the monorelease binary
+  variables:
+    GIT_DEPTH: "0"             # full history; otherwise tags and commits cannot be found
+    GIT_STRATEGY: fetch        # reuse the runner's clone: only the delta is fetched
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "beta"
+  script:
+    - git config user.name  "mono-release-bot"
+    - git config user.email "mono-release-bot@example.com"
+    - git remote set-url origin "https://oauth2:${MONO_RELEASE_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    - git config fetch.writeCommitGraph true   # speeds up history traversal
+    - git fetch origin main --tags             # the stable branch must be visible from pre-release branches
+    - MONO_RELEASE_TRACE=1 monorelease plan    # shows what will be released (TRACE shows where time goes; optional)
+    - monorelease release --push
