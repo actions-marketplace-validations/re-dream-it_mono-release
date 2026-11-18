@@ -155,7 +155,14 @@ if $DOCKER; then
       echo "$gh_token" | docker login ghcr.io -u "$gh_user" --password-stdin >/dev/null
       echo "   logged in to ghcr.io as $gh_user"
     fi
-    docker buildx build --platform "$PLATFORMS" --build-arg "VERSION=$VERSION" "${tags[@]}" --push "$SRC"
+    # ghcr.io links a multi-architecture image to its repository through annotations on the image index
+    # (the labels inside the image are not looked at), which is also what shows it on the repository page
+    source_url=$(git remote get-url origin 2>/dev/null | sed -E 's#^git@([^:]+):#https://\1/#; s#^https?://[^@/]*@#https://#; s#\.git$##' || true)
+    annotations=(--annotation "index:org.opencontainers.image.licenses=MIT"
+                 --annotation "index:org.opencontainers.image.version=$VERSION"
+                 --annotation "index:org.opencontainers.image.description=Versioning and release tagging for monorepos")
+    [[ "$source_url" == https://* ]] && annotations+=(--annotation "index:org.opencontainers.image.source=$source_url")
+    docker buildx build --platform "$PLATFORMS" --build-arg "VERSION=$VERSION" "${tags[@]}" "${annotations[@]}" --push "$SRC"
     echo "   pushed $image for $PLATFORMS"
   else
     docker build -q --build-arg "VERSION=$VERSION" "${tags[@]}" "$SRC" >/dev/null

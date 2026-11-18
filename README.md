@@ -53,6 +53,12 @@ This produces a single static binary. Copy it somewhere on your `PATH`. For a Li
 
 Or go to release page and download ready binary for your system
 
+Or use the Docker image, published with every release (`linux/amd64` and `linux/arm64`):
+
+```sh
+docker run --rm -v "$PWD":/repo -w /repo ghcr.io/re-dream-it/monorelease plan
+```
+
 ## Quick start
 
 Copy [examples/mono-release.yaml](examples/mono-release.yaml) to the repository root as `mono-release.yaml` and adjust the component names and paths to your layout. The example is annotated and covers everything described below. A working configuration needs nothing more than a `components` map where every component has `paths`.
