@@ -2,15 +2,29 @@
 # Releases mono-release with mono-release: works out the next version from the commits, tags it,
 # regenerates CHANGELOG.md, pushes, and creates the GitHub release.
 #
-#   scripts/release.sh          show the plan and ask before releasing
-#   scripts/release.sh --yes    do not ask
+#   scripts/release.sh                      show the plan and ask before releasing
+#   scripts/release.sh --yes                do not ask
+#   scripts/release.sh --no-artifacts       tag and push only: do not build and upload the binaries
+#   scripts/release.sh --image ghcr.io/re-dream-it/monorelease
+#                                           also build and push a multi-architecture Docker image
 #
-# A GitHub token is read from GITHUB_TOKEN or from `gh auth token`; without one the GitHub release is skipped.
+# After the tag is pushed it builds the release artifacts (scripts/build-release.sh) and uploads them to the
+# GitHub release. A GitHub token is read from GITHUB_TOKEN or from `gh auth token`; without one the GitHub
+# release page is skipped, and so is the upload.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 ASSUME_YES=false
-[[ "${1:-}" == "--yes" ]] && ASSUME_YES=true
+ARTIFACTS=true
+IMAGE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --yes)          ASSUME_YES=true; shift ;;
+    --no-artifacts) ARTIFACTS=false; shift ;;
+    --image)        IMAGE="${2:?--image needs an image name}"; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
 
 branch=$(git rev-parse --abbrev-ref HEAD)
 [[ "$branch" == "main" ]] || { echo "release from main, not from '$branch'" >&2; exit 1; }
@@ -55,3 +69,16 @@ if ! git diff --quiet -- CHANGELOG.md 2>/dev/null || [[ -n "$(git ls-files --oth
   git push origin HEAD
   echo "== changelog committed"
 fi
+
+$ARTIFACTS || exit 0
+
+# the binaries and the image of the version that was just tagged, attached to its GitHub release
+build_flags=()
+if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+  build_flags+=(--upload)
+else
+  echo "warning: gh is missing or not logged in: the artifacts are built but not uploaded" >&2
+fi
+if [[ -n "$IMAGE" ]]; then build_flags+=(--push "$IMAGE"); else build_flags+=(--no-docker); fi
+echo "== artifacts"
+scripts/build-release.sh "${build_flags[@]}"

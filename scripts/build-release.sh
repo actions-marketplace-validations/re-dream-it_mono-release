@@ -9,12 +9,13 @@
 # and the Docker image (monorelease:<version>, plus :latest for a stable version).
 #
 # The sources come from the release tag (monorelease@<version>), not from the working tree, so the
-# artifacts are exactly what was released. Run it after scripts/release.sh, then upload dist/* to the
-# GitHub release.
+# artifacts are exactly what was released. scripts/release.sh runs it for you; to run it yourself after
+# a release, add --upload to attach the files to the GitHub release (it is created if it does not exist).
 #
 #   scripts/build-release.sh                       latest release tag
 #   scripts/build-release.sh --version 0.2.0       a specific release
 #   scripts/build-release.sh --snapshot            the current working tree, version "snapshot" (to try the build)
+#   scripts/build-release.sh --upload              also upload the files to the GitHub release (needs `gh auth login`)
 #   scripts/build-release.sh --no-docker           archives only
 #   scripts/build-release.sh --push ghcr.io/re-dream-it/monorelease
 #                                                  push a multi-architecture image (needs `docker login`)
@@ -25,6 +26,7 @@ ROOT=$(pwd)
 VERSION=""
 SNAPSHOT=false
 DOCKER=true
+UPLOAD=false
 PUSH_IMAGE=""
 PLATFORMS="linux/amd64,linux/arm64"
 OUT="dist"
@@ -37,6 +39,7 @@ while [[ $# -gt 0 ]]; do
     --version)   VERSION="${2:?--version needs a value}"; shift 2 ;;
     --snapshot)  SNAPSHOT=true; shift ;;
     --no-docker) DOCKER=false; shift ;;
+    --upload)    UPLOAD=true; shift ;;
     --push)      PUSH_IMAGE="${2:?--push needs an image name, e.g. ghcr.io/re-dream-it/monorelease}"; shift 2 ;;
     --platforms) PLATFORMS="${2:?--platforms needs a value}"; shift 2 ;;
     -h|--help)   usage; exit 0 ;;
@@ -45,6 +48,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 command -v go >/dev/null || { echo "go not found" >&2; exit 1; }
+if $UPLOAD; then
+  # fail before the long build, not after it
+  $SNAPSHOT && { echo "--upload needs a release, not --snapshot" >&2; exit 1; }
+  command -v gh >/dev/null || { echo "gh not found: install the GitHub CLI (brew install gh) and run 'gh auth login'" >&2; exit 1; }
+  gh auth status >/dev/null 2>&1 || { echo "gh is not logged in: run 'gh auth login' (or set GITHUB_TOKEN)" >&2; exit 1; }
+fi
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -135,11 +144,26 @@ if $DOCKER; then
   fi
 fi
 
+# --- GitHub release: create it when missing, then attach the files
+if $UPLOAD; then
+  echo "== GitHub release $TAG"
+  files=("$ROOT/$OUT"/*.tar.gz "$ROOT/$OUT"/*.zip "$ROOT/$OUT/checksums.txt")
+  if gh release view "$TAG" >/dev/null 2>&1; then
+    gh release upload "$TAG" "${files[@]}" --clobber
+    echo "   uploaded ${#files[@]} files to the existing release"
+  else
+    create=(--title "monorelease $VERSION" --verify-tag)
+    [[ "$VERSION" == *-* ]] && create+=(--prerelease)
+    if [[ -f "$ROOT/$OUT/RELEASE_NOTES.md" ]]; then create+=(--notes-file "$ROOT/$OUT/RELEASE_NOTES.md"); else create+=(--notes ""); fi
+    gh release create "$TAG" "${create[@]}" "${files[@]}"
+    echo "   created the release with ${#files[@]} files"
+  fi
+fi
+
 echo
 echo "== done: $OUT/"
 ls -1 "$ROOT/$OUT" | sed 's/^/   /'
-if ! $SNAPSHOT; then
+if ! $SNAPSHOT && ! $UPLOAD; then
   echo
-  echo "Upload to the GitHub release of monorelease@$VERSION: the files in $OUT/ (the notes are in RELEASE_NOTES.md)."
-  echo "With the GitHub CLI:  gh release upload monorelease@$VERSION $OUT/*.tar.gz $OUT/*.zip $OUT/checksums.txt --clobber"
+  echo "Upload to the GitHub release of $TAG: the files in $OUT/ (the notes are in RELEASE_NOTES.md), or rerun with --upload."
 fi

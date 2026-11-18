@@ -337,10 +337,10 @@ The script runs the tests, shows the plan, and after confirmation pushes the com
 
 ### Release artifacts
 
-After a release, build the files to attach to the GitHub release:
+`scripts/release.sh` also builds the files of the release and attaches them to its GitHub release, so one command does the whole release. To run that step on its own (for a release that is already tagged):
 
 ```sh
-scripts/build-release.sh                  # or: make dist
+scripts/build-release.sh --upload         # or: make dist, which only builds
 ```
 
 It builds from the release tag, not from the working tree, so the artifacts are exactly what was released, and writes to `dist/`:
@@ -348,9 +348,11 @@ It builds from the release tag, not from the working tree, so the artifacts are 
 - `monorelease_<version>_<os>_<arch>.tar.gz` for linux and darwin, `.zip` for windows, each for amd64 and arm64, with the license and README;
 - `checksums.txt` with the SHA-256 of every archive;
 - `RELEASE_NOTES.md`, the notes of the release as text for the release page;
-- the Docker image `monorelease:<version>` (and `:latest` for a stable version), built for this machine's platform.
+- the Docker image `monorelease:<version>` (and `:latest` for a stable version), unless `--no-docker` is given.
 
-Upload the files in `dist/` to the GitHub release (`gh release upload monorelease@<version> dist/*.tar.gz dist/*.zip dist/checksums.txt`). To publish a multi-architecture image (`linux/amd64` and `linux/arm64`), log in to the registry and run `scripts/build-release.sh --push ghcr.io/re-dream-it/monorelease`. Other options: `--version 0.2.0` for an older release, `--no-docker` for archives only, `--snapshot` to try the build on the working tree. The script needs Go, `git`, `tar`, `zip` and, unless `--no-docker`, Docker.
+With `--upload` the GitHub release is created from `RELEASE_NOTES.md` if it does not exist yet (a version with a pre-release part such as `-beta.1` is marked as a pre-release), and the archives and checksums are attached; if it exists, the files are uploaded over the old ones. This needs the GitHub CLI logged in (`gh auth login`) or `GITHUB_TOKEN`. Without it `scripts/release.sh` still tags and pushes, builds the files, and prints a warning instead of uploading.
+
+Other options: `scripts/release.sh --no-artifacts` to only tag and push; `--image ghcr.io/re-dream-it/monorelease` (after `docker login`) to also build and push a multi-architecture image (`linux/amd64` and `linux/arm64`); `scripts/build-release.sh --version 0.2.0` for an older release, and `--snapshot` to try the build on the working tree. The scripts need Go, `git`, `tar`, `zip` and, for the image, Docker.
 
 ## License
 
