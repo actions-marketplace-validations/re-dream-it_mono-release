@@ -46,15 +46,7 @@ Or go to release page and download ready binary for your system
 
 ## Quick start
 
-Create `mono-release.yaml` in the repository root:
-
-```yaml
-components:
-  orders:
-    paths: [services/orders/**]
-  billing:
-    paths: [services/billing/**]
-```
+Copy [examples/mono-release.yaml](examples/mono-release.yaml) to the repository root as `mono-release.yaml` and adjust the component names and paths to your layout. The example is annotated and covers everything described below. A working configuration needs nothing more than a `components` map where every component has `paths`.
 
 Then:
 
@@ -64,7 +56,7 @@ monorelease release          # create the tags locally
 monorelease release --push   # create and push them
 ```
 
-Example output of `plan`:
+Example output of `plan` with the example configuration, after a `feat:` commit in `libs/common`:
 
 ```
 billing: 1.1.0 -> 1.2.0 [minor, 0 commits, cascade from common-lib]
@@ -73,42 +65,27 @@ orders: 1.1.0 -> 1.1.1 [patch, 0 commits, cascade from common-lib]
 umbrella platform: 1.4.0 -> 1.5.0 [minor]
   billing@1.2.0
   common-lib@1.1.0
+  notifications@1.0.0
   orders@1.1.1
 ```
 
-A full annotated configuration lives in [examples/mono-release.yaml](examples/mono-release.yaml).
+`billing` and `orders` are released because they depend on `common-lib`, each with the bump from its own `cascade` setting. `notifications` has `cascade: none`, so it keeps its version, which is recorded in the `platform` umbrella.
 
 ## Configuration
 
-`mono-release.yaml` in the repository root (override with `-c`):
+The configuration lives in `mono-release.yaml` in the repository root (override with `-c`). A complete, annotated example is in [examples/mono-release.yaml](examples/mono-release.yaml).
 
-```yaml
-initial_version: 1.0.0        # version of a component's first release (default 1.0.0)
-
-branches:                     # optional; without it every branch releases stable versions
-  - {name: main}              # stable releases
-  - {name: beta, prerelease: beta}      # 1.5.0-beta.1, 1.5.0-beta.2, ...
-  - {name: "rc/*", prerelease: rc}      # names may be globs
-
-components:
-  common-lib:
-    paths: [libs/common/**]
-  orders:
-    paths: [services/orders/**, shared/proto/orders/**]   # may span several directories
-    exclude: ["**/*.md"]      # changes that do not count
-    depends_on: [common-lib]  # releasing common-lib also releases orders
-    cascade: patch            # patch (default) | minor | none
-  notifications:
-    paths: [services/notifications/**]
-    depends_on: [common-lib]
-    cascade: none             # a dependency release does not affect this component
-
-umbrellas:
-  platform:
-    members: [orders, notifications, common-lib]
-  everything:
-    all: true                 # every component, including ones added later
-```
+| Key | Description |
+|---|---|
+| `initial_version` | Version of a component's first release. Default `1.0.0`. |
+| `branches[].name` | Release branch. May be a glob such as `rc/*`. |
+| `branches[].prerelease` | Pre-release channel of the branch (`beta`, `rc`, ...). Empty or omitted means stable releases. |
+| `components.<name>.paths` | Glob patterns of the files that belong to the component. A component may span several directories. Required. |
+| `components.<name>.exclude` | Glob patterns of files that do not count as a change of the component. |
+| `components.<name>.depends_on` | Components this one depends on. Releasing a dependency also releases this component. |
+| `components.<name>.cascade` | Bump applied when a dependency is released: `patch` (default), `minor` or `none`. |
+| `umbrellas.<name>.members` | Components that belong to the umbrella. |
+| `umbrellas.<name>.all` | `true` makes the umbrella cover every component, including ones added later. Cannot be combined with `members`. |
 
 Rules:
 
