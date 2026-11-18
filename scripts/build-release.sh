@@ -18,7 +18,10 @@
 #   scripts/build-release.sh --upload              also upload the files to the GitHub release (needs `gh auth login`)
 #   scripts/build-release.sh --no-docker           archives only
 #   scripts/build-release.sh --push ghcr.io/re-dream-it/monorelease
-#                                                  push a multi-architecture image (needs `docker login`)
+#                                                  push a multi-architecture image; for ghcr.io it logs in with the
+#                                                  gh token, which needs the write:packages scope (see below)
+#
+# One-time setup for ghcr.io:  gh auth refresh -h github.com -s write:packages
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
@@ -48,6 +51,17 @@ while [[ $# -gt 0 ]]; do
 done
 
 command -v go >/dev/null || { echo "go not found" >&2; exit 1; }
+if [[ "$PUSH_IMAGE" == ghcr.io/* ]]; then
+  # fail before the long build when the push cannot work
+  if ! grep -q '"ghcr.io"' "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null; then
+    command -v gh >/dev/null || { echo "not logged in to ghcr.io: run 'docker login ghcr.io' or install gh" >&2; exit 1; }
+    if [[ -z "${GITHUB_TOKEN:-}" ]] && ! gh auth status 2>&1 | grep -q 'write:packages'; then
+      echo "the gh token cannot push images to ghcr.io. Add the scope once with:" >&2
+      echo "    gh auth refresh -h github.com -s write:packages" >&2
+      exit 1
+    fi
+  fi
+fi
 if $UPLOAD; then
   # fail before the long build, not after it
   $SNAPSHOT && { echo "--upload needs a release, not --snapshot" >&2; exit 1; }
@@ -135,6 +149,12 @@ if $DOCKER; then
   if ! $SNAPSHOT && [[ "$VERSION" != *-* ]]; then tags+=(-t "$image:latest"); fi
   echo "== docker image ${tags[*]}"
   if [[ -n "$PUSH_IMAGE" ]]; then
+    if [[ "$PUSH_IMAGE" == ghcr.io/* ]] && ! grep -q '"ghcr.io"' "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null; then
+      gh_token="${GITHUB_TOKEN:-$(gh auth token)}"
+      gh_user="${GITHUB_ACTOR:-$(GITHUB_TOKEN="$gh_token" gh api user --jq .login)}"
+      echo "$gh_token" | docker login ghcr.io -u "$gh_user" --password-stdin >/dev/null
+      echo "   logged in to ghcr.io as $gh_user"
+    fi
     docker buildx build --platform "$PLATFORMS" --build-arg "VERSION=$VERSION" "${tags[@]}" --push "$SRC"
     echo "   pushed $image for $PLATFORMS"
   else

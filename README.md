@@ -348,11 +348,19 @@ It builds from the release tag, not from the working tree, so the artifacts are 
 - `monorelease_<version>_<os>_<arch>.tar.gz` for linux and darwin, `.zip` for windows, each for amd64 and arm64, with the license and README;
 - `checksums.txt` with the SHA-256 of every archive;
 - `RELEASE_NOTES.md`, the notes of the release as text for the release page;
-- the Docker image `monorelease:<version>` (and `:latest` for a stable version), unless `--no-docker` is given.
+- the Docker image `monorelease:<version>` (and `:latest` for a stable version), built for this machine's platform, unless `--no-docker` is given.
 
 With `--upload` the GitHub release is created from `RELEASE_NOTES.md` if it does not exist yet (a version with a pre-release part such as `-beta.1` is marked as a pre-release), and the archives and checksums are attached; if it exists, the files are uploaded over the old ones. This needs the GitHub CLI logged in (`gh auth login`) or `GITHUB_TOKEN`. Without it `scripts/release.sh` still tags and pushes, builds the files, and prints a warning instead of uploading.
 
-Other options: `scripts/release.sh --no-artifacts` to only tag and push; `--image ghcr.io/re-dream-it/monorelease` (after `docker login`) to also build and push a multi-architecture image (`linux/amd64` and `linux/arm64`); `scripts/build-release.sh --version 0.2.0` for an older release, and `--snapshot` to try the build on the working tree. The scripts need Go, `git`, `tar`, `zip` and, for the image, Docker.
+**Docker image.** `scripts/release.sh` also pushes a multi-architecture image (`linux/amd64` and `linux/arm64`, tagged with the version and, for a stable version, `latest`) to `ghcr.io/<owner>/monorelease`. It logs in to `ghcr.io` with the GitHub CLI token, which needs the `write:packages` scope. Add it once:
+
+```sh
+gh auth refresh -h github.com -s write:packages
+```
+
+Without the scope the image is skipped with a warning and the rest of the release goes on. A package that is published for the first time is private by default; make it public once in the package settings on GitHub if the image should be pullable by everyone. Use `--image NAME` to push to another registry (after `docker login`) and `--no-image` to skip the image.
+
+Other options: `scripts/release.sh --no-artifacts` to only tag and push; `scripts/build-release.sh --version 0.2.0` for an older release, `--push NAME` to publish the image of a release that is already tagged, and `--snapshot` to try the build on the working tree. The scripts need Go, `git`, `tar`, `zip` and, for the image, Docker.
 
 ## License
 
