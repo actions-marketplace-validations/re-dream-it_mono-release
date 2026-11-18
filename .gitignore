@@ -5,6 +5,7 @@ DESIGN.md
 /monorelease
 /monorelease-*
 /bin/
+/dist/
 *.test
 
 # Editors and OS

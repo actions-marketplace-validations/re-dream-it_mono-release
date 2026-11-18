@@ -10,10 +10,10 @@ import (
 	"github.com/Masterminds/semver/v3"
 	"github.com/bmatcuk/doublestar/v4"
 
-	"mono-release/internal/commits"
-	"mono-release/internal/config"
-	"mono-release/internal/git"
-	"mono-release/internal/graph"
+	"github.com/re-dream-it/mono-release/internal/commits"
+	"github.com/re-dream-it/mono-release/internal/config"
+	"github.com/re-dream-it/mono-release/internal/git"
+	"github.com/re-dream-it/mono-release/internal/graph"
 )
 
 type Change struct {
@@ -30,6 +30,7 @@ type Release struct {
 	Tag         string   `json:"tag"`
 	Bump        string   `json:"bump"`
 	Channel     string   `json:"channel,omitempty"` // prerelease channel; empty for stable
+	Forced      bool     `json:"forced,omitempty"`  // released because of --force
 	Changes     []Change `json:"changes,omitempty"`
 	CascadeFrom []string `json:"cascade_from,omitempty"` // released dependencies that triggered a cascade bump
 }
@@ -91,7 +92,7 @@ type Versions struct {
 func Latest(cfg *config.Config, r git.Reader, opt Options) (*Versions, error) {
 	v := &Versions{Components: map[string]string{}, Umbrellas: map[string]string{}}
 	one := func(name string, into map[string]string) error {
-		tags, stableTags, err := opt.tags(r, name)
+		tags, stableTags, err := opt.tags(r, cfg.TagPrefix(name))
 		if err != nil {
 			return err
 		}
@@ -118,6 +119,38 @@ type Plan struct {
 	Channel   string            `json:"channel,omitempty"`
 	Releases  []Release         `json:"releases"`
 	Umbrellas []UmbrellaRelease `json:"umbrellas,omitempty"`
+	// Details explains the decision for every component and umbrella; filled only with Options.Explain.
+	Details map[string]*Detail `json:"details,omitempty"`
+}
+
+// Consideration is one commit that was looked at for a component.
+type Consideration struct {
+	SHA     string `json:"sha"`
+	Subject string `json:"subject"`
+	Via     string `json:"via"`               // paths | scope
+	Bump    string `json:"bump"`              // the bump this commit asks for
+	Skipped bool   `json:"skipped,omitempty"` // ignored because of [skip release]
+	Fresh   bool   `json:"fresh"`             // newer than the latest tag (on a prerelease channel older ones only count towards the bump)
+}
+
+// Detail explains why a component or umbrella is, or is not, released.
+type Detail struct {
+	Name        string            `json:"name"`
+	Kind        string            `json:"kind"` // component | umbrella
+	Channel     string            `json:"channel,omitempty"`
+	Current     string            `json:"current,omitempty"`
+	CurrentTag  string            `json:"current_tag,omitempty"`
+	BaseTag     string            `json:"base_tag,omitempty"` // the tag the history is counted from
+	Considered  []Consideration   `json:"considered,omitempty"`
+	OwnBump     string            `json:"own_bump"`
+	Forced      string            `json:"forced,omitempty"`
+	CascadeFrom []string          `json:"cascade_from,omitempty"`
+	CascadeBump string            `json:"cascade_bump,omitempty"`
+	Released    bool              `json:"released"`
+	Next        string            `json:"next,omitempty"`
+	Tag         string            `json:"tag,omitempty"`
+	Reason      string            `json:"reason,omitempty"`  // why there is no release
+	Members     map[string]string `json:"members,omitempty"` // umbrella: component -> "1.0.0 -> 1.1.0 (released)" / "1.0.0 (unchanged)"
 }
 
 // tagState is what the tags say about a component (or umbrella) on a given channel.
@@ -222,15 +255,20 @@ type Options struct {
 	// StableRefs are refs of the stable branches; stable tags reachable from them count as
 	// released even when they are not in the current branch's history.
 	StableRefs []string
+	// Force releases the listed components even without significant commits, with at least this bump.
+	Force map[string]commits.Bump
+	// Explain fills Plan.Details.
+	Explain bool
 }
 
-// tags returns the component's tags: those reachable from HEAD and the stable ones from StableRefs.
-func (o Options) tags(r git.Reader, name string) (head, stable []git.Tag, err error) {
-	if head, err = r.Tags(name, "HEAD"); err != nil {
+// tags returns the tags named "<prefix><version>": those reachable from the reader's ref and
+// the stable ones from StableRefs.
+func (o Options) tags(r git.Reader, prefix string) (head, stable []git.Tag, err error) {
+	if head, err = r.Tags(prefix, ""); err != nil {
 		return nil, nil, err
 	}
 	for _, ref := range o.StableRefs {
-		ts, err := r.Tags(name, ref)
+		ts, err := r.Tags(prefix, ref)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -243,22 +281,52 @@ func (o Options) tags(r git.Reader, name string) (head, stable []git.Tag, err er
 	return head, stable, nil
 }
 
+// Relevance says why a commit counts for a component: "paths" when it touches the component's
+// files, "scope" when its Conventional Commit scope names the component (or one of its scope
+// aliases), or "" when it does not concern the component at all.
+func Relevance(cfg *config.Config, name string, c git.Commit, p commits.Parsed) string {
+	if touches(cfg.Components[name], c.Files) {
+		return "paths"
+	}
+	if len(p.Scopes) > 0 && cfg.ScopeMatches(name, p.Scopes) {
+		return "scope"
+	}
+	return ""
+}
+
 // Build computes which components need a release and their next versions.
 func Build(cfg *config.Config, r git.Reader, opt Options) (*Plan, error) {
 	channel := opt.Channel
+	for name := range opt.Force {
+		if _, ok := cfg.Components[name]; !ok {
+			return nil, fmt.Errorf("--force: unknown component %q", name)
+		}
+	}
 	head, err := r.Head()
 	if err != nil {
 		return nil, err
 	}
 	plan := &Plan{SHA: head, Channel: channel}
+	if opt.Explain {
+		plan.Details = map[string]*Detail{}
+	}
+	detail := func(name, kind string) *Detail {
+		if !opt.Explain {
+			return nil
+		}
+		d := &Detail{Name: name, Kind: kind, Channel: channel}
+		plan.Details[name] = d
+		return d
+	}
 
 	states := map[string]tagState{}
 	rels := map[string]*Release{}
 	bumps := map[string]commits.Bump{}
+	details := map[string]*Detail{}
 
 	// 0. tag state of every component, then load all needed history in one pass
 	for _, name := range cfg.Names() {
-		tags, stableTags, err := opt.tags(r, name)
+		tags, stableTags, err := opt.tags(r, cfg.TagPrefix(name))
 		if err != nil {
 			return nil, err
 		}
@@ -280,8 +348,15 @@ func Build(cfg *config.Config, r git.Reader, opt Options) (*Plan, error) {
 
 	// 1. direct changes
 	for _, name := range cfg.Names() {
-		comp := cfg.Components[name]
 		st := states[name]
+		det := detail(name, "component")
+		details[name] = det
+		if det != nil {
+			if cur := st.latest(); cur != nil {
+				det.Current, det.CurrentTag = cur.String(), st.latestTag()
+			}
+			det.BaseTag = st.stableTag
+		}
 
 		// bump is cumulative since the last stable release; "fresh" commits are those since the latest tag
 		all, err := r.Commits(st.stableTag)
@@ -301,30 +376,55 @@ func Build(cfg *config.Config, r git.Reader, opt Options) (*Plan, error) {
 
 		var changes []Change
 		max, freshMax := commits.None, commits.None
+		skipped := 0
 		for _, c := range all {
-			if !touches(comp, c.Files) {
+			p := commits.Parse(c.Subject, c.Body)
+			via := Relevance(cfg, name, c, p)
+			if via == "" {
 				continue
 			}
-			p := commits.Parse(c.Subject, c.Body)
+			isFresh := st.pre == nil || fresh[c.SHA]
+			if det != nil {
+				det.Considered = append(det.Considered, Consideration{
+					SHA: c.SHA, Subject: c.Subject, Via: via, Bump: p.Bump.String(), Skipped: p.Skip, Fresh: isFresh})
+			}
+			if p.Skip {
+				skipped++
+				continue // "[skip release]": the commit is ignored completely
+			}
 			if p.Bump > max {
 				max = p.Bump
 			}
-			if st.pre == nil || fresh[c.SHA] {
+			if isFresh {
 				changes = append(changes, Change{SHA: c.SHA, Subject: c.Subject, Type: p.Type, Bump: p.Bump.String()})
 				if p.Bump > freshMax {
 					freshMax = p.Bump
 				}
 			}
 		}
-		if freshMax == commits.None {
+		if det != nil {
+			det.OwnBump = max.String()
+		}
+		forced, isForced := opt.Force[name]
+		if isForced {
+			forced = maxBump(forced, commits.Patch)
+			if det != nil {
+				det.Forced = forced.String()
+			}
+		}
+		if freshMax == commits.None && !isForced {
+			if det != nil {
+				det.Reason = noReleaseReason(name, st, len(det.Considered), skipped, st.pre != nil && max != commits.None)
+			}
 			continue
 		}
-		rel, err := newRelease(cfg, name, st, max, channel)
+		bumpTo := maxBump(max, forced)
+		rel, err := newRelease(cfg, name, st, bumpTo, channel)
 		if err != nil {
 			return nil, err
 		}
-		rel.Changes = changes
-		rels[name], bumps[name] = rel, max
+		rel.Changes, rel.Forced = changes, isForced
+		rels[name], bumps[name] = rel, bumpTo
 	}
 
 	// 2. cascade through the dependency graph (dependencies first)
@@ -335,9 +435,6 @@ func Build(cfg *config.Config, r git.Reader, opt Options) (*Plan, error) {
 	for _, name := range order {
 		comp := cfg.Components[name]
 		st := states[name]
-		if comp.Cascade == "none" || st.latest() == nil {
-			continue // components that were never released have no version to bump
-		}
 		var from []string
 		for _, d := range comp.DependsOn {
 			if rels[d] != nil {
@@ -348,9 +445,25 @@ func Build(cfg *config.Config, r git.Reader, opt Options) (*Plan, error) {
 			continue
 		}
 		sort.Strings(from)
+		det := details[name]
+		if comp.Cascade == "none" {
+			if det != nil && rels[name] == nil {
+				det.Reason = fmt.Sprintf("%s released, but cascade is none for %s", strings.Join(from, ", "), name)
+			}
+			continue
+		}
+		if st.latest() == nil {
+			if det != nil && rels[name] == nil {
+				det.Reason = fmt.Sprintf("%s released, but %s has never been released, so there is no version to bump", strings.Join(from, ", "), name)
+			}
+			continue
+		}
 		cb := commits.Patch
 		if comp.Cascade == "minor" {
 			cb = commits.Minor
+		}
+		if det != nil {
+			det.CascadeFrom, det.CascadeBump = from, cb.String()
 		}
 		if rel := rels[name]; rel != nil {
 			rel.CascadeFrom = from
@@ -359,7 +472,7 @@ func Build(cfg *config.Config, r git.Reader, opt Options) (*Plan, error) {
 				if err != nil {
 					return nil, err
 				}
-				nr.Changes, nr.CascadeFrom = rel.Changes, from
+				nr.Changes, nr.CascadeFrom, nr.Forced = rel.Changes, from, rel.Forced
 				rels[name], bumps[name] = nr, cb
 			}
 			continue
@@ -375,40 +488,98 @@ func Build(cfg *config.Config, r git.Reader, opt Options) (*Plan, error) {
 	for _, name := range cfg.Names() {
 		if rel := rels[name]; rel != nil {
 			plan.Releases = append(plan.Releases, *rel)
+			if det := details[name]; det != nil {
+				det.Released, det.Next, det.Tag, det.Reason = true, rel.Next, rel.Tag, ""
+			}
 		}
 	}
 
 	// 3. umbrellas: released when any member is released
 	for _, uname := range cfg.UmbrellaNames() {
 		u := cfg.Umbrellas[uname]
+		det := detail(uname, "umbrella")
 		max := commits.None
 		members := map[string]string{}
+		var memberNotes map[string]string
+		if det != nil {
+			memberNotes = map[string]string{}
+		}
 		for _, m := range cfg.MemberNames(u) {
 			if rel := rels[m]; rel != nil {
 				members[m] = rel.Next
 				if bumps[m] > max {
 					max = bumps[m]
 				}
+				if det != nil {
+					from := "(first release)"
+					if rel.Current != "" {
+						from = rel.Current
+					}
+					memberNotes[m] = fmt.Sprintf("%s -> %s (%s)", from, rel.Next, rel.Bump)
+				}
 			} else if v := states[m].latest(); v != nil {
 				members[m] = v.String()
+				if det != nil {
+					memberNotes[m] = v.String() + " (unchanged)"
+				}
+			} else if det != nil {
+				memberNotes[m] = "not released yet"
 			}
 		}
-		if max == commits.None {
-			continue
-		}
-		tags, stableTags, err := opt.tags(r, uname)
+		tags, stableTags, err := opt.tags(r, cfg.TagPrefix(uname))
 		if err != nil {
 			return nil, err
 		}
-		ur, err := newRelease(cfg, uname, resolveState(tags, stableTags, channel), max, channel)
+		ust := resolveState(tags, stableTags, channel)
+		if det != nil {
+			det.Members, det.OwnBump = memberNotes, max.String()
+			if cur := ust.latest(); cur != nil {
+				det.Current, det.CurrentTag = cur.String(), ust.latestTag()
+			}
+		}
+		if max == commits.None {
+			if det != nil {
+				det.Reason = "no member of the umbrella is released"
+			}
+			continue
+		}
+		ur, err := newRelease(cfg, uname, ust, max, channel)
 		if err != nil {
 			return nil, err
 		}
 		plan.Umbrellas = append(plan.Umbrellas, UmbrellaRelease{
 			Name: uname, Current: ur.Current, Next: ur.Next, Tag: ur.Tag, Bump: ur.Bump, Channel: channel, Members: members,
 		})
+		if det != nil {
+			det.Released, det.Next, det.Tag = true, ur.Next, ur.Tag
+		}
 	}
 	return plan, nil
+}
+
+func maxBump(a, b commits.Bump) commits.Bump {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// noReleaseReason says in words why a component has no release of its own.
+func noReleaseReason(name string, st tagState, considered, skipped int, onlyOld bool) string {
+	since := "the beginning of history"
+	if st.stableTag != "" {
+		since = st.stableTag
+	}
+	switch {
+	case considered == 0:
+		return fmt.Sprintf("no commit since %s touches %s", since, name)
+	case skipped == considered:
+		return fmt.Sprintf("all %d relevant commit(s) since %s are marked [skip release]", considered, since)
+	case onlyOld:
+		return fmt.Sprintf("nothing new since the latest tag %s (earlier changes are already in it)", st.latestTag())
+	default:
+		return fmt.Sprintf("%d relevant commit(s) since %s, but none is significant (feat, fix, perf or a breaking change)", considered-skipped, since)
+	}
 }
 
 func newRelease(cfg *config.Config, name string, st tagState, b commits.Bump, channel string) (*Release, error) {
@@ -416,7 +587,7 @@ func newRelease(cfg *config.Config, name string, st tagState, b commits.Bump, ch
 	if err != nil {
 		return nil, err
 	}
-	rel := &Release{Component: name, Bump: b.String(), Channel: channel, Next: next.String(), Tag: name + "@" + next.String()}
+	rel := &Release{Component: name, Bump: b.String(), Channel: channel, Next: next.String(), Tag: cfg.TagName(name, next.String())}
 	if cur := st.latest(); cur != nil {
 		rel.Current = cur.String()
 	}
@@ -454,4 +625,83 @@ func matchAny(patterns []string, file string) bool {
 		}
 	}
 	return false
+}
+
+// ChangedOptions selects how "changed" is computed.
+type ChangedOptions struct {
+	Options
+	// Base, when set, compares the current ref with the point where it diverged from Base
+	// (typical for a merge request pipeline). Empty means: changes since each component's latest release.
+	Base string
+	// WithDependents also lists everything that (transitively) depends on a changed component.
+	WithDependents bool
+}
+
+// Changed lists the components with changes, sorted. Unlike a release plan it does not care whether
+// the changes are significant: any commit that touches the component's files (or names it in its scope)
+// counts, because the point is to know what to build and test.
+func Changed(cfg *config.Config, r git.Reader, opt ChangedOptions) ([]string, error) {
+	set := map[string]bool{}
+	if opt.Base != "" {
+		files, err := r.ChangedFiles(opt.Base)
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range cfg.Names() {
+			if touches(cfg.Components[name], files) {
+				set[name] = true
+			}
+		}
+	} else {
+		states := map[string]tagState{}
+		var bases []string
+		for _, name := range cfg.Names() {
+			tags, stableTags, err := opt.tags(r, cfg.TagPrefix(name))
+			if err != nil {
+				return nil, err
+			}
+			states[name] = resolveState(tags, stableTags, opt.Channel)
+			bases = append(bases, states[name].latestTag())
+		}
+		if hl, ok := r.(git.HistoryLoader); ok {
+			if err := hl.LoadHistory(bases); err != nil {
+				return nil, err
+			}
+		}
+		for _, name := range cfg.Names() {
+			cs, err := r.Commits(states[name].latestTag())
+			if err != nil {
+				return nil, err
+			}
+			for _, c := range cs {
+				if Relevance(cfg, name, c, commits.Parse(c.Subject, c.Body)) != "" {
+					set[name] = true
+					break
+				}
+			}
+		}
+	}
+	if opt.WithDependents {
+		// walk the reversed dependency graph until nothing new is added
+		for changed := true; changed; {
+			changed = false
+			for _, name := range cfg.Names() {
+				if set[name] {
+					continue
+				}
+				for _, d := range cfg.Components[name].DependsOn {
+					if set[d] {
+						set[name], changed = true, true
+						break
+					}
+				}
+			}
+		}
+	}
+	names := make([]string, 0, len(set))
+	for n := range set {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names, nil
 }

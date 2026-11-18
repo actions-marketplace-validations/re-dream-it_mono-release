@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -30,6 +31,10 @@ type Tag struct {
 	Commit  string // commit the tag points to (peeled); may be empty for non-git readers
 }
 
+// strictVersion is the semver.org grammar. Tags whose version part does not match are ignored, so
+// "orders-v2-v1.0.0" is never mistaken for a version of "orders-v".
+var strictVersion = regexp.MustCompile(`^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
+
 // HistoryLoader is implemented by readers that can fetch the history for several tags in one pass.
 // Calling it before Commits is optional; Commits falls back to loading on demand.
 type HistoryLoader interface {
@@ -38,12 +43,20 @@ type HistoryLoader interface {
 }
 
 type Reader interface {
-	// Tags returns the version tags "<component>@<ver>" reachable from ref (e.g. "HEAD" or a branch).
-	Tags(component, ref string) ([]Tag, error)
+	// Tags returns the version tags named "<prefix><version>" reachable from ref. An empty ref means
+	// the reader's current ref (HEAD unless --ref was given); other refs are e.g. "refs/heads/main".
+	Tags(prefix, ref string) ([]Tag, error)
 	// BranchRefs returns the existing refs for a branch name: the local branch and origin's copy.
 	BranchRefs(branch string) []string
-	// Commits returns commits in (sinceTag, HEAD], newest first. Empty sinceTag means full history.
+	// Commits returns commits in (sinceTag, ref], newest first. Empty sinceTag means full history.
 	Commits(sinceTag string) ([]Commit, error)
+	// Between returns the commits reachable from to but not from from (empty from: all of them), newest first.
+	Between(from, to string) ([]Commit, error)
+	// ChangedFiles lists the files changed between the merge base of base and the current ref, and the ref.
+	ChangedFiles(base string) ([]string, error)
+	// TagInfo returns the commit a tag points to and its date (tagger date, or commit date for lightweight tags).
+	TagInfo(tag string) (commit string, date time.Time, err error)
+	// Head returns the commit of the current ref.
 	Head() (string, error)
 	CreateTag(name, sha, message string) error
 	// TagMessage returns the message of an annotated tag; ok is false if the tag does not exist.
@@ -54,15 +67,17 @@ type Reader interface {
 
 // CLI implements Reader via the git binary. Create it with New.
 type CLI struct {
-	Dir   string
+	Dir string
+	// Ref is the revision to read ("" = HEAD). Everything - tags, history, the plan - is computed as if it were checked out.
+	Ref   string
 	trace bool
 
 	mu    sync.Mutex
 	stats map[string]*stat
 
 	tagMu     sync.Mutex
-	tags      map[string]map[string][]Tag // ref -> component -> tags
-	tagCommit map[string]string           // tag name -> commit
+	tags      map[string][]Tag  // ref -> every valid-looking version tag (name, parsed later per prefix)
+	tagCommit map[string]string // tag name -> commit
 
 	histMu  sync.Mutex
 	lists   map[string][]string // base tag ("" = full history) -> commit SHAs, newest first
@@ -84,7 +99,7 @@ func TraceEnabled() bool {
 func New(dir string) *CLI {
 	return &CLI{
 		Dir: dir, trace: TraceEnabled(), stats: map[string]*stat{},
-		tags: map[string]map[string][]Tag{}, tagCommit: map[string]string{}, lists: map[string][]string{}, commits: map[string]Commit{},
+		tags: map[string][]Tag{}, tagCommit: map[string]string{}, lists: map[string][]string{}, commits: map[string]Commit{},
 	}
 }
 
@@ -161,25 +176,34 @@ func (g *CLI) PrintSummary(w io.Writer) {
 	fmt.Fprintf(w, "[trace]   %-12s %5d calls  %10s\n", "TOTAL", calls, total.Round(time.Millisecond))
 }
 
+func (g *CLI) ref() string {
+	if g.Ref == "" {
+		return "HEAD"
+	}
+	return g.Ref
+}
+
 func (g *CLI) Head() (string, error) {
-	out, err := g.run("rev-parse", "HEAD")
+	out, err := g.run("rev-parse", "--verify", g.ref()+"^{commit}")
 	return strings.TrimSpace(out), err
 }
 
-// Tags returns the valid "<component>@<version>" tags reachable from ref (unordered).
-// All version tags of a ref are read with a single git call and then served from memory.
-func (g *CLI) Tags(component, ref string) ([]Tag, error) {
+// Tags returns the tags named "<prefix><version>" reachable from ref (unordered). Every tag of a ref
+// is read with a single git call and then served from memory.
+func (g *CLI) Tags(prefix, ref string) ([]Tag, error) {
+	if ref == "" {
+		ref = g.ref()
+	}
 	g.tagMu.Lock()
 	defer g.tagMu.Unlock()
-	byComp, ok := g.tags[ref]
+	all, ok := g.tags[ref]
 	if !ok {
 		// one line per tag: "<name> <object> <peeled object>" (the peeled object is empty for lightweight tags)
 		out, err := g.run("for-each-ref", "--merged="+ref,
-			"--format=%(refname:strip=2) %(objectname) %(*objectname)", "refs/tags/*@*")
+			"--format=%(refname:strip=2) %(objectname) %(*objectname)", "refs/tags/*")
 		if err != nil {
 			return nil, err
 		}
-		byComp = map[string][]Tag{}
 		for _, line := range strings.Split(out, "\n") {
 			f := strings.Fields(line)
 			if len(f) < 2 {
@@ -189,17 +213,25 @@ func (g *CLI) Tags(component, ref string) ([]Tag, error) {
 			if len(f) >= 3 {
 				commit = f[2] // annotated tag: use the commit it points to
 			}
-			comp, ver, _ := strings.Cut(name, "@") // component names never contain '@'
-			v, err := semver.NewVersion(ver)
-			if err != nil {
-				continue // ignore malformed tags
-			}
 			g.tagCommit[name] = commit
-			byComp[comp] = append(byComp[comp], Tag{Name: name, Version: v, Commit: commit})
+			all = append(all, Tag{Name: name, Commit: commit})
 		}
-		g.tags[ref] = byComp
+		g.tags[ref] = all
 	}
-	return byComp[component], nil
+	var res []Tag
+	for _, t := range all {
+		ver, ok := strings.CutPrefix(t.Name, prefix)
+		if !ok || !strictVersion.MatchString(ver) {
+			continue
+		}
+		v, err := semver.NewVersion(ver)
+		if err != nil {
+			continue
+		}
+		t.Version = v
+		res = append(res, t)
+	}
+	return res, nil
 }
 
 func (g *CLI) BranchRefs(branch string) []string {
@@ -218,7 +250,7 @@ func (g *CLI) CurrentBranch() (string, error) {
 	return strings.TrimSpace(out), err
 }
 
-// Commits returns commits in (sinceTag, HEAD], newest first. Empty sinceTag means full history.
+// Commits returns commits in (sinceTag, ref], newest first. Empty sinceTag means full history.
 func (g *CLI) Commits(sinceTag string) ([]Commit, error) {
 	if err := g.LoadHistory([]string{sinceTag}); err != nil {
 		return nil, err
@@ -233,9 +265,9 @@ func (g *CLI) Commits(sinceTag string) ([]Commit, error) {
 	return res, nil
 }
 
-// graph reads the commit graph of HEAD once: SHAs newest first and each commit's parents.
+// graph reads the commit graph of the current ref once: SHAs newest first and each commit's parents.
 func (g *CLI) graph() (order []string, parents map[string][]string, err error) {
-	out, err := g.run("rev-list", "--parents", "HEAD")
+	out, err := g.run("rev-list", "--parents", g.ref())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -310,7 +342,7 @@ func (g *CLI) LoadHistory(bases []string) error {
 			continue
 		}
 		if _, inHistory := parents[commit]; !inHistory {
-			slow = append(slow, i) // not an ancestor of HEAD (e.g. stable tag on another branch)
+			slow = append(slow, i) // not an ancestor of the ref (e.g. stable tag on another branch)
 			continue
 		}
 		reach, ok := reachCache[commit]
@@ -359,7 +391,16 @@ func (g *CLI) LoadHistory(bases []string) error {
 	}
 
 	// 2. details of every needed commit in a single call
-	out, err := g.runIn(strings.Join(need, "\n")+"\n",
+	return g.loadDetails(need)
+}
+
+// loadDetails reads subject, body and files of the given commits with ONE git call into the cache.
+// The caller must hold histMu.
+func (g *CLI) loadDetails(shas []string) error {
+	if len(shas) == 0 {
+		return nil
+	}
+	out, err := g.runIn(strings.Join(shas, "\n")+"\n",
 		"-c", "core.quotepath=false", "log", "--no-walk=unsorted", "--stdin",
 		"--diff-merges=first-parent", "--no-renames", "--no-ext-diff", "--no-color",
 		"--name-only", "--format=%x1e%H%x1f%an%x1f%s%x1f%b%x1f")
@@ -385,11 +426,86 @@ func (g *CLI) LoadHistory(bases []string) error {
 	return nil
 }
 
+// Between returns the commits reachable from "to" but not from "from", newest first.
+func (g *CLI) Between(from, to string) ([]Commit, error) {
+	rng := to
+	if from != "" {
+		rng = from + ".." + to
+	}
+	out, err := g.run("rev-list", rng)
+	if err != nil {
+		return nil, err
+	}
+	shas := strings.Fields(out)
+	g.histMu.Lock()
+	defer g.histMu.Unlock()
+	var need []string
+	for _, sha := range shas {
+		if _, ok := g.commits[sha]; !ok {
+			need = append(need, sha)
+		}
+	}
+	if err := g.loadDetails(need); err != nil {
+		return nil, err
+	}
+	res := make([]Commit, 0, len(shas))
+	for _, sha := range shas {
+		res = append(res, g.commits[sha])
+	}
+	return res, nil
+}
+
+// ChangedFiles lists files changed on the current ref since it diverged from base (three-dot diff).
+func (g *CLI) ChangedFiles(base string) ([]string, error) {
+	out, err := g.run("-c", "core.quotepath=false", "diff", "--name-only", "--no-renames", base+"..."+g.ref())
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimRight(line, "\r"); line != "" {
+			files = append(files, line)
+		}
+	}
+	return files, nil
+}
+
+// TagInfo returns the commit a tag points to and the tag's date.
+func (g *CLI) TagInfo(tag string) (string, time.Time, error) {
+	out, err := g.run("for-each-ref", "--format=%(objectname) %(*objectname) %(creatordate:iso-strict)", "refs/tags/"+tag)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	f := strings.Fields(out)
+	if len(f) < 2 {
+		return "", time.Time{}, fmt.Errorf("tag %s not found", tag)
+	}
+	commit, dateStr := f[0], f[len(f)-1]
+	if len(f) >= 3 {
+		commit = f[1] // annotated: the peeled object is the commit
+	}
+	t, _ := time.Parse(time.RFC3339, dateStr)
+	return commit, t, nil
+}
+
+// RemoteURL returns the URL of a remote, or "" if there is none.
+func (g *CLI) RemoteURL(remote string) string {
+	out, err := g.run("remote", "get-url", remote)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
 func (g *CLI) CreateTag(name, sha, message string) error {
 	if message == "" {
 		message = name
 	}
 	_, err := g.run("tag", "-a", name, sha, "-m", message)
+	// the tag lists read so far are stale now
+	g.tagMu.Lock()
+	g.tags = map[string][]Tag{}
+	g.tagMu.Unlock()
 	return err
 }
 

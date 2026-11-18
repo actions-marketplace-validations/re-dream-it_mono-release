@@ -6,10 +6,14 @@ stages: [release]
 
 release:
   stage: release
-  image: golang:1.27           # or an image that already contains the monorelease binary
+  # an image that contains monorelease and git (see the Dockerfile in this repository)
+  image: { name: registry.example.com/tools/monorelease:latest, entrypoint: [""] }
   variables:
     GIT_DEPTH: "0"             # full history; otherwise tags and commits cannot be found
     GIT_STRATEGY: fetch        # reuse the runner's clone: only the delta is fetched
+  artifacts:
+    paths: [out/]              # release notes written by `monorelease release` (see "notes" in the config)
+    when: always
   rules:
     - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "beta"
   script:

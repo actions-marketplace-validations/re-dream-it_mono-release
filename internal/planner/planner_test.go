@@ -2,12 +2,15 @@ package planner
 
 import (
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Masterminds/semver/v3"
 
-	"mono-release/internal/config"
-	"mono-release/internal/git"
+	"github.com/re-dream-it/mono-release/internal/commits"
+	"github.com/re-dream-it/mono-release/internal/config"
+	"github.com/re-dream-it/mono-release/internal/git"
 )
 
 type fake struct {
@@ -16,12 +19,18 @@ type fake struct {
 	extra    map[string][]string // component -> additional tag versions
 	commits  []git.Commit
 	messages map[string]string       // tag name -> message
+	changed  map[string][]string     // base ref -> changed files
 	since    map[string][]git.Commit // tag name -> commits after that tag (falls back to commits)
 }
 
 func (f fake) BranchRefs(string) []string { return nil }
 
-func (f fake) Tags(c, ref string) ([]git.Tag, error) {
+func (f fake) Between(string, string) ([]git.Commit, error) { return nil, nil }
+func (f fake) ChangedFiles(base string) ([]string, error)   { return f.changed[base], nil }
+func (f fake) TagInfo(string) (string, time.Time, error)    { return "", time.Time{}, nil }
+
+func (f fake) Tags(prefix, ref string) ([]git.Tag, error) {
+	c := strings.TrimSuffix(prefix, "@") // component behind the prefix
 	var vs []string
 	if ref == "main" {
 		vs = append(vs, f.stable[c]...)
@@ -33,7 +42,7 @@ func (f fake) Tags(c, ref string) ([]git.Tag, error) {
 	}
 	var tags []git.Tag
 	for _, v := range vs {
-		tags = append(tags, git.Tag{Name: c + "@" + v, Version: semver.MustParse(v)})
+		tags = append(tags, git.Tag{Name: prefix + v, Version: semver.MustParse(v)})
 	}
 	return tags, nil
 }
@@ -371,5 +380,207 @@ func TestLatestStableSeesStableBranch(t *testing.T) {
 	}
 	if st.Components["a"] != "1.1.0" {
 		t.Errorf("got %q, want 1.1.0", st.Components["a"])
+	}
+}
+
+func mustCfg(t *testing.T, y string) *config.Config {
+	t.Helper()
+	c, err := config.Parse([]byte(y))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func releasesOf(p *Plan) map[string]string {
+	m := map[string]string{}
+	for _, r := range p.Releases {
+		m[r.Component] = r.Current + "->" + r.Next
+	}
+	return m
+}
+
+func TestScopeIsAnExtraSignal(t *testing.T) {
+	cfg := mustCfg(t, "components:\n orders: {paths: [services/orders/**], scopes: [api]}\n billing: {paths: [services/billing/**]}\n audit: {paths: [services/audit/**]}\n")
+	f := fake{
+		versions: map[string]string{"orders": "1.0.0", "billing": "1.0.0", "audit": "1.0.0"},
+		commits: []git.Commit{
+			{SHA: "1", Subject: "feat(api): new endpoint", Files: []string{"shared/gateway/x.yaml"}}, // alias scope, outside paths
+			{SHA: "2", Subject: "fix(billing): rounding", Files: []string{"docs/notes.txt"}},         // own name as scope, outside paths
+			{SHA: "3", Subject: "feat(unknown): nothing", Files: []string{"somewhere/else"}},         // scope that names nobody
+			{SHA: "4", Subject: "feat: no scope at all", Files: []string{"somewhere/else"}},          // outside every path
+			{SHA: "5", Subject: "feat(orders, audit): both", Files: []string{"services/billing/x"}},  // several scopes + another component's path
+		},
+	}
+	plan, err := Build(cfg, f, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := releasesOf(plan)
+	want := map[string]string{"orders": "1.0.0->1.1.0", "billing": "1.0.0->1.1.0", "audit": "1.0.0->1.1.0"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+	// the scope alone is enough: without any file match billing's fix (patch) must not be lost,
+	// and the stronger bump from the path-matching commit 5 must win
+	if plan.Releases[1].Component != "billing" || plan.Releases[1].Bump != "minor" {
+		t.Errorf("billing: %+v", plan.Releases[1])
+	}
+}
+
+func TestSkipRelease(t *testing.T) {
+	cfg := mustCfg(t, "components:\n a: {paths: [a/**]}\n b: {paths: [b/**]}\n")
+	f := fake{
+		versions: map[string]string{"a": "1.0.0", "b": "1.0.0"},
+		commits: []git.Commit{
+			{SHA: "1", Subject: "feat!: big thing [skip release]", Files: []string{"a/x"}},
+			{SHA: "2", Subject: "fix: real fix", Body: "ok", Files: []string{"a/y"}},
+			{SHA: "3", Subject: "feat: other", Body: "[skip release]", Files: []string{"b/x"}},
+		},
+	}
+	plan, _ := Build(cfg, f, Options{})
+	if got := releasesOf(plan); !reflect.DeepEqual(got, map[string]string{"a": "1.0.0->1.0.1"}) {
+		t.Errorf("skip: %v (a: only the fix counts, b: nothing)", got)
+	}
+	for _, ch := range plan.Releases[0].Changes {
+		if strings.Contains(ch.Subject, "skip release") {
+			t.Errorf("skipped commit leaked into changes: %+v", ch)
+		}
+	}
+}
+
+func TestForce(t *testing.T) {
+	cfg := mustCfg(t, "components:\n lib: {paths: [lib/**]}\n app: {paths: [app/**], depends_on: [lib]}\n other: {paths: [o/**]}\n")
+	f := fake{versions: map[string]string{"lib": "1.0.0", "app": "2.0.0", "other": "3.0.0"}}
+
+	plan, err := Build(cfg, f, Options{Force: map[string]commits.Bump{"lib": commits.Minor}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"lib": "1.0.0->1.1.0", "app": "2.0.0->2.0.1"} // forced, and its dependent follows by cascade
+	if got := releasesOf(plan); !reflect.DeepEqual(got, want) {
+		t.Errorf("force: %v, want %v", got, want)
+	}
+	if !plan.Releases[1].Forced || plan.Releases[0].Forced {
+		t.Errorf("only lib is forced: %+v", plan.Releases)
+	}
+	// a force never lowers what the commits already ask for
+	f.commits = []git.Commit{{SHA: "1", Subject: "feat!: x", Files: []string{"lib/a"}}}
+	plan, _ = Build(cfg, f, Options{Force: map[string]commits.Bump{"lib": commits.Patch}})
+	if got := releasesOf(plan)["lib"]; got != "1.0.0->2.0.0" {
+		t.Errorf("force must not lower the bump: %s", got)
+	}
+	if _, err := Build(cfg, f, Options{Force: map[string]commits.Bump{"nope": commits.Patch}}); err == nil {
+		t.Error("forcing an unknown component should fail")
+	}
+	// never released component: forced release is the initial version
+	plan, _ = Build(cfg, fake{}, Options{Force: map[string]commits.Bump{"other": commits.Major}})
+	if got := releasesOf(plan)["other"]; got != "->1.0.0" {
+		t.Errorf("forced first release: %q", got)
+	}
+	// on a prerelease channel a forced release counts even though nothing is new since the last tag
+	pf := fake{versions: map[string]string{"lib": "1.0.0"}, extra: map[string][]string{"lib": {"1.1.0-beta.1"}}, since: map[string][]git.Commit{"lib@1.1.0-beta.1": {}}}
+	pcfg := mustCfg(t, "branches:\n - {name: main}\n - {name: beta, prerelease: beta}\ncomponents:\n lib: {paths: [lib/**]}\n")
+	plan, _ = Build(pcfg, pf, Options{Channel: "beta", StableRefs: []string{"main"}, Force: map[string]commits.Bump{"lib": commits.Minor}})
+	if got := releasesOf(plan)["lib"]; got != "1.1.0-beta.1->1.1.0-beta.2" {
+		t.Errorf("forced on channel: %q", got)
+	}
+}
+
+func TestExplain(t *testing.T) {
+	cfg := mustCfg(t, `
+components:
+  lib: {paths: [lib/**]}
+  app: {paths: [app/**], depends_on: [lib]}
+  quiet: {paths: [q/**], depends_on: [lib], cascade: none}
+  idle: {paths: [i/**]}
+  chore: {paths: [c/**]}
+  skipped: {paths: [s/**]}
+umbrellas:
+  platform: {all: true}
+`)
+	f := fake{
+		versions: map[string]string{"lib": "1.0.0", "app": "1.0.0", "quiet": "1.0.0", "idle": "1.0.0", "chore": "1.0.0", "skipped": "1.0.0", "platform": "1.0.0"},
+		commits: []git.Commit{
+			{SHA: "a1", Subject: "feat: lib change", Files: []string{"lib/x"}},
+			{SHA: "a2", Subject: "chore: tidy", Files: []string{"c/x"}},
+			{SHA: "a3", Subject: "fix: nope [skip release]", Files: []string{"s/x"}},
+		},
+	}
+	plan, err := Build(cfg, f, Options{Explain: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := plan.Details
+	if d["lib"] == nil || !d["lib"].Released || d["lib"].Next != "1.1.0" || d["lib"].OwnBump != "minor" || len(d["lib"].Considered) != 1 || d["lib"].Considered[0].Via != "paths" {
+		t.Errorf("lib: %+v", d["lib"])
+	}
+	if !d["app"].Released || d["app"].CascadeBump != "patch" || !reflect.DeepEqual(d["app"].CascadeFrom, []string{"lib"}) {
+		t.Errorf("app: %+v", d["app"])
+	}
+	for name, mustContain := range map[string]string{
+		"quiet":   "cascade is none",
+		"idle":    "no commit since idle@1.0.0 touches idle",
+		"chore":   "none is significant",
+		"skipped": "[skip release]",
+	} {
+		if d[name].Released || !strings.Contains(d[name].Reason, mustContain) {
+			t.Errorf("%s: released=%v reason=%q, want mention of %q", name, d[name].Released, d[name].Reason, mustContain)
+		}
+	}
+	if u := d["platform"]; !u.Released || u.Kind != "umbrella" || !strings.Contains(u.Members["lib"], "1.0.0 -> 1.1.0") || !strings.Contains(u.Members["idle"], "unchanged") {
+		t.Errorf("platform: %+v", u)
+	}
+	// without Explain no details are collected
+	if p2, _ := Build(cfg, f, Options{}); p2.Details != nil {
+		t.Error("Details must be empty unless requested")
+	}
+}
+
+func TestChanged(t *testing.T) {
+	cfg := mustCfg(t, `
+components:
+  lib: {paths: [lib/**]}
+  app: {paths: [app/**], depends_on: [lib]}
+  web: {paths: [web/**], depends_on: [app]}
+  solo: {paths: [solo/**], scopes: [loner]}
+`)
+	f := fake{
+		versions: map[string]string{"lib": "1.0.0", "app": "1.0.0", "web": "1.0.0", "solo": "1.0.0"},
+		changed:  map[string][]string{"origin/main": {"lib/a.java", "README.md"}},
+		commits: []git.Commit{
+			{SHA: "1", Subject: "chore: not significant", Files: []string{"app/x"}},
+			{SHA: "2", Subject: "docs(loner): by scope only", Files: []string{"elsewhere"}},
+		},
+	}
+	byBase, err := Changed(cfg, f, ChangedOptions{Base: "origin/main"})
+	if err != nil || !reflect.DeepEqual(byBase, []string{"lib"}) {
+		t.Errorf("base diff: %v %v", byBase, err)
+	}
+	withDeps, _ := Changed(cfg, f, ChangedOptions{Base: "origin/main", WithDependents: true})
+	if !reflect.DeepEqual(withDeps, []string{"app", "lib", "web"}) {
+		t.Errorf("with dependents (transitive): %v", withDeps)
+	}
+	sinceRelease, _ := Changed(cfg, f, ChangedOptions{})
+	if !reflect.DeepEqual(sinceRelease, []string{"app", "solo"}) {
+		t.Errorf("since release (any commit, scope counts): %v", sinceRelease)
+	}
+}
+
+func TestTagNames(t *testing.T) {
+	cfg := mustCfg(t, "components:\n orders: {paths: [o/**]}\numbrellas:\n platform: {all: true}\n")
+	f := fake{
+		versions: map[string]string{"orders": "1.0.0"},
+		commits:  []git.Commit{{SHA: "1", Subject: "feat: x", Files: []string{"o/a"}}},
+	}
+	plan, err := Build(cfg, f, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Releases[0].Tag != "orders@1.1.0" || plan.Umbrellas[0].Tag != "platform@1.0.0" {
+		t.Errorf("tags: %s %s", plan.Releases[0].Tag, plan.Umbrellas[0].Tag)
+	}
+	if m := plan.Umbrellas[0].Manifest(); m != "orders@1.1.0\n" {
+		t.Errorf("manifest: %q", m)
 	}
 }

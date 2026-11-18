@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -40,11 +41,11 @@ func TestCLI(t *testing.T) {
 	if err := g.CreateTag("a@1.0.0", head, ""); err != nil {
 		t.Fatal(err)
 	}
-	tags, err := g.Tags("a", "HEAD")
+	tags, err := g.Tags("a@", "HEAD")
 	if err != nil || len(tags) != 1 || tags[0].Name != "a@1.0.0" || tags[0].Version.String() != "1.0.0" {
 		t.Fatalf("Tags: %v %v", tags, err)
 	}
-	if none, _ := g.Tags("zzz", "HEAD"); len(none) != 0 {
+	if none, _ := g.Tags("zzz@", "HEAD"); len(none) != 0 {
 		t.Error("unexpected tags for unknown component")
 	}
 	br0, _ := g.CurrentBranch()
@@ -151,12 +152,12 @@ func TestCommitsMatchRevList(t *testing.T) {
 
 	g := New(d)
 	for _, ref := range []string{"HEAD"} {
-		if _, err := g.Tags("a", ref); err != nil {
+		if _, err := g.Tags("a@", ref); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// tags on main are not reachable from beta; resolve them through main so the reader knows their commits
-	if _, err := g.Tags("x", "main"); err != nil {
+	if _, err := g.Tags("x@", "main"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -248,5 +249,134 @@ func TestTagMessage(t *testing.T) {
 	}
 	if _, ok, err := g.TagMessage("platform@9.9.9"); ok || err != nil {
 		t.Errorf("missing tag: %v %v", ok, err)
+	}
+}
+
+func newRepo(t *testing.T) (string, *CLI) {
+	t.Helper()
+	d := t.TempDir()
+	sh(t, d, "init", "-q", "-b", "main")
+	sh(t, d, "config", "user.email", "t@t")
+	sh(t, d, "config", "user.name", "t")
+	return d, New(d)
+}
+
+func commitFile(t *testing.T, d, file, msg string) {
+	t.Helper()
+	write(t, d, file, msg)
+	sh(t, d, "add", "-A")
+	sh(t, d, "commit", "-qm", msg)
+}
+
+func TestTagsPrefixAndStrictVersions(t *testing.T) {
+	d, g := newRepo(t)
+	commitFile(t, d, "f", "init")
+	for _, n := range []string{
+		"orders@1.0.0", "orders@1.2.0-beta.1", // versions of "orders"
+		"orders-api@3.0.0", // another component whose name starts like "orders"
+		"orders@1.2",       // not a full version
+		"orders@01.0.0",    // leading zero
+		"orders@v1.0.0",    // a v prefix is not part of the format
+		"v9.9.9", "release-1",
+	} {
+		sh(t, d, "tag", n)
+	}
+	got, err := g.Tags("orders@", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, tg := range got {
+		names = append(names, tg.Name)
+	}
+	sort.Strings(names)
+	if !reflect.DeepEqual(names, []string{"orders@1.0.0", "orders@1.2.0-beta.1"}) {
+		t.Errorf("orders tags: %v", names)
+	}
+	if got, _ := g.Tags("orders-api@", ""); len(got) != 1 || got[0].Version.String() != "3.0.0" {
+		t.Errorf("orders-api tags: %v", got)
+	}
+}
+
+func TestRefReadsAnotherBranch(t *testing.T) {
+	d, g := newRepo(t)
+	commitFile(t, d, "a/1", "feat: one")
+	sh(t, d, "tag", "-a", "a@1.0.0", "-m", "x")
+	sh(t, d, "checkout", "-qb", "other")
+	commitFile(t, d, "a/2", "fix: on other")
+	sh(t, d, "tag", "-a", "a@1.0.1", "-m", "x")
+	sh(t, d, "checkout", "-q", "main") // main does not have a@1.0.1
+
+	if tags, _ := g.Tags("a@", ""); len(tags) != 1 {
+		t.Errorf("HEAD (main) tags: %v", tags)
+	}
+	r := New(d)
+	r.Ref = "other"
+	tags, err := r.Tags("a@", "")
+	if err != nil || len(tags) != 2 {
+		t.Fatalf("--ref other: %v %v", tags, err)
+	}
+	head, _ := r.Head()
+	want := strings.TrimSpace(func() string { o, _ := exec.Command("git", "-C", d, "rev-parse", "other").Output(); return string(o) }())
+	if head != want {
+		t.Errorf("Head with ref: %s want %s", head, want)
+	}
+	cs, err := r.Commits("a@1.0.0")
+	if err != nil || len(cs) != 1 || cs[0].Subject != "fix: on other" {
+		t.Errorf("Commits with ref: %v %v", cs, err)
+	}
+}
+
+func TestBetweenChangedFilesTagInfo(t *testing.T) {
+	d, g := newRepo(t)
+	commitFile(t, d, "a/1", "feat: one")
+	sh(t, d, "tag", "-a", "a@1.0.0", "-m", "annotated")
+	commitFile(t, d, "a/2", "fix: two")
+	commitFile(t, d, "b/1", "feat: three")
+	sh(t, d, "tag", "b@1.0.0") // lightweight
+	sh(t, d, "checkout", "-qb", "topic", "a@1.0.0")
+	commitFile(t, d, "c/1", "feat: on topic")
+	sh(t, d, "checkout", "-q", "main")
+
+	cs, err := g.Between("a@1.0.0", "b@1.0.0")
+	if err != nil || len(cs) != 2 || cs[0].Subject != "feat: three" || cs[1].Subject != "fix: two" {
+		t.Errorf("Between: %v %v", cs, err)
+	}
+	if all, _ := g.Between("", "a@1.0.0"); len(all) != 1 {
+		t.Errorf("Between from root: %d", len(all))
+	}
+	files, err := g.ChangedFiles("topic")
+	sort.Strings(files)
+	if err != nil || !reflect.DeepEqual(files, []string{"a/2", "b/1"}) {
+		t.Errorf("ChangedFiles(topic) = %v %v (main changed a/2, b/1 since topic diverged)", files, err)
+	}
+	commit, date, err := g.TagInfo("a@1.0.0")
+	if err != nil || len(commit) != 40 || date.IsZero() {
+		t.Errorf("TagInfo annotated: %q %v %v", commit, date, err)
+	}
+	head, _ := g.Head()
+	if c, d2, err := g.TagInfo("b@1.0.0"); err != nil || c != head || d2.IsZero() {
+		t.Errorf("TagInfo lightweight: %q %v %v", c, d2, err)
+	}
+	if _, _, err := g.TagInfo("nope@1.0.0"); err == nil {
+		t.Error("expected error for missing tag")
+	}
+}
+
+func TestCreateTagRefreshesCachedTags(t *testing.T) {
+	d, g := newRepo(t)
+	commitFile(t, d, "f", "init")
+	head, _ := g.Head()
+	if err := g.CreateTag("a@1.0.0", head, ""); err != nil {
+		t.Fatal(err)
+	}
+	if tags, _ := g.Tags("a@", ""); len(tags) != 1 { // fills the cache
+		t.Fatalf("tags: %v", tags)
+	}
+	if err := g.CreateTag("a@1.1.0", head, ""); err != nil {
+		t.Fatal(err)
+	}
+	if tags, _ := g.Tags("a@", ""); len(tags) != 2 {
+		t.Errorf("a tag created after the first read must be visible: %v", tags)
 	}
 }

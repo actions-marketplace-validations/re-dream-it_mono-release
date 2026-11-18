@@ -16,6 +16,9 @@ mono-release gives you:
 - **Pre-release channels** per branch (`1.5.0-beta.1`), independent per component.
 - **Tags are the source of truth.** No state files, no release commits, nothing written back to your repository.
 - **Fast on large repositories**: the number of git calls does not depend on the number of components.
+- **Release notes** per component or umbrella, generated from the commits and written to files or published as GitHub/GitLab releases.
+- **CI helpers**: `changed` lists what to build, `explain` says why a version was chosen, `--ref` reads any branch without a checkout.
+- **Escape hatches**: Conventional Commit scopes as an extra signal, `[skip release]` and `--force`.
 
 ## How it works
 
@@ -35,9 +38,15 @@ mono-release gives you:
 Build from source:
 
 ```sh
-git clone https://github.com/OWNER/mono-release.git
+git clone https://github.com/re-dream-it/mono-release.git
 cd mono-release
 go build -o monorelease ./cmd/monorelease
+```
+
+Or install the latest commit with the Go toolchain (the binary then reports `dev` as its version; use a release build for a versioned one):
+
+```sh
+go install github.com/re-dream-it/mono-release/cmd/monorelease@latest
 ```
 
 This produces a single static binary. Copy it somewhere on your `PATH`. For a Linux CI runner cross-compile with `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o monorelease ./cmd/monorelease`.
@@ -78,12 +87,18 @@ The configuration lives in `mono-release.yaml` in the repository root (override 
 | Key | Description |
 |---|---|
 | `initial_version` | Version of a component's first release. Default `1.0.0`. |
+| `releases` | For which tags a GitHub/GitLab release is created on `release --push`: `umbrella`, `components`, `all` or `none`. Default: `umbrella` if the config has umbrellas, otherwise nothing. |
+| `repository_url` | Web URL of the repository for links in the notes, for example `https://github.com/acme/mono`. Derived from the remote when omitted. |
+| `notes[].for` | Component or umbrella the notes are generated for, or `*` for all of them. |
+| `notes[].file` | Output file, relative to the repository. `{name}` and `{version}` are replaced. |
+| `notes[].history` | `latest` (default): notes of the newest release. `all`: a changelog of every release. |
 | `branches[].name` | Release branch. May be a glob such as `rc/*`. |
 | `branches[].prerelease` | Pre-release channel of the branch (`beta`, `rc`, ...). Empty or omitted means stable releases. |
 | `components.<name>.paths` | Glob patterns of the files that belong to the component. A component may span several directories. Required. |
 | `components.<name>.exclude` | Glob patterns of files that do not count as a change of the component. |
 | `components.<name>.depends_on` | Components this one depends on. Releasing a dependency also releases this component. |
 | `components.<name>.cascade` | Bump applied when a dependency is released: `patch` (default), `minor` or `none`. |
+| `components.<name>.scopes` | Extra Conventional Commit scopes that point at this component, besides its own name. |
 | `umbrellas.<name>.members` | Components that belong to the umbrella. |
 | `umbrellas.<name>.all` | `true` makes the umbrella cover every component, including ones added later. Cannot be combined with `members`. |
 
@@ -98,23 +113,36 @@ Rules:
 
 ```
 monorelease plan                         show what would be released and the next versions
-monorelease release                      create tags for the plan
+monorelease release                      create tags for the plan (--push also pushes them and creates releases)
 monorelease version [name]               latest released version of a component or umbrella (or of all of them)
 monorelease manifest <umbrella> [ver]    components and versions in an umbrella release
+monorelease changed                      components with changes (what to build and test)
+monorelease explain <name>               why a component or umbrella is, or is not, released
+monorelease notes [name] [ver]           release notes; without a name writes the files configured in `notes`
+monorelease completion <shell>           shell completion script (bash, zsh, fish)
 ```
 
 Flags:
 
 | Flag | Meaning |
 |---|---|
+| `-v`, `--version` | print the version of monorelease itself and exit |
 | `-c <file>` | config path (default `mono-release.yaml`) |
 | `-C <dir>` | repository directory (default `.`) |
 | `--branch <name>` | branch to work from (default: `$CI_COMMIT_BRANCH`, else the checked-out branch) |
-| `--json` | JSON output (`plan`, `version`, `manifest`) |
+| `--ref <ref>` | read this branch, tag or commit instead of the checked-out one (not for `release`) |
+| `--json` | JSON output |
 | `--stable` | `version`: only stable versions, whatever the branch |
 | `--component <name>` | `manifest`: print only that component's version |
+| `--force <name>[=bump]` | `plan`/`release`: release the component even without significant commits; bump is `patch` (default), `minor` or `major`; may be repeated |
+| `--base <ref>` | `changed`: compare with the point where the current ref diverged from this ref |
+| `--with-dependents` | `changed`: also list the components that depend on changed ones |
+| `--write` | `notes <name>`: write the configured files for that name instead of printing |
+| `--all` | `notes <name>`: print the changelog of every release |
 | `--push` | `release`: push the created tags |
-| `--remote <name>` | remote for `--push` (default `origin`) |
+| `--remote <name>` | remote for `--push` and for commit links (default `origin`) |
+| `--no-notes` | `release`: do not write the configured notes files |
+| `--no-releases` | `release`: do not create GitHub/GitLab releases |
 
 Flags may be placed before or after positional arguments.
 
@@ -134,6 +162,84 @@ On a pre-release branch the pre-release versions are shown (`1.5.0-beta.2`), on 
 
 `release --push` pushes all new tags in a single atomic push.
 
+### What changed (for CI)
+
+```sh
+monorelease changed                         # components with changes since their last release
+monorelease changed --base origin/main      # merge request pipeline: what this branch changes
+monorelease changed --base origin/main --with-dependents --json
+```
+
+Prints the names of the components with changes, one per line, so a pipeline can build and test only those. With `--base` the changes are those made on the current branch since it diverged from the base (a three-dot diff). Without it, they are the commits since each component's latest release. Any commit counts, significant or not, because the point is what to build. `--with-dependents` adds everything that depends on a changed component, transitively. Unlike `plan`, `changed` works on any branch, including a merge request's feature branch.
+
+### Why this version? (explain)
+
+```
+$ monorelease explain orders
+orders (component)
+  branch:   stable
+  current:  1.1.0 (tag orders@1.1.0)
+  counting commits since: orders@1.1.0
+
+  commits that count for this component:
+    6ae3582  fix: typo [skip release]                     via paths  ignored ([skip release])
+    2047553  fix: null pointer in checkout                via paths  patch
+    01fdd98  feat(api): new gateway route                 via scope  minor
+
+  highest bump from commits: minor
+  cascade: common-lib released, so this component gets at least patch
+
+  result: release 1.1.0 -> 1.2.0 (tag orders@1.2.0)
+```
+
+For a component that is not released it says why instead (no commits touch it, none is significant, all are skipped, a dependency released but `cascade` is `none`, ...). `--json` gives the same data for tools.
+
+### Reading another ref
+
+`--ref` makes every read command behave as if that revision were checked out, without touching your working tree:
+
+```sh
+monorelease version --ref origin/beta
+monorelease explain orders --ref origin/main
+```
+
+The branch decides the release channel, so for a branch name it is taken from the ref (`origin/beta` means `beta`). For a tag or a commit say which branch it belongs to with `--branch`. `release` always works on the checked-out commit and refuses `--ref`.
+
+### Release notes
+
+Notes are generated from tags and commits, so they can be produced for any existing release:
+
+```sh
+monorelease notes orders 1.2.0      # print the notes of one release (default: the latest)
+monorelease notes platform          # an umbrella
+monorelease notes platform --all    # a changelog of every release
+monorelease notes                   # write the files configured in the `notes` section
+```
+
+The notes of a **component** list its commits since the previous release, grouped into breaking changes, features, bug fixes and performance, with the rest folded into a collapsible "Other changes" block. Commits marked `[skip release]` and merge commits are left out, and every commit links to the repository. The notes of an **umbrella** show a table of its members' versions (what changed since the previous umbrella release is marked `old → new`) followed by the notes of every member that changed. A component that was released only because a dependency changed says so.
+
+Which notes are written, and where, is configured in the `notes` section (see [examples/mono-release.yaml](examples/mono-release.yaml)). `monorelease release` writes those files after tagging. They are written into the working tree and never committed; in CI keep them as job artifacts. Commit links are built from the `origin` URL (credentials are stripped) or from `repository_url`.
+
+### GitHub and GitLab releases
+
+With `release --push`, mono-release can create a release page for each new tag, with the notes as its text. The `releases` setting says for which tags: `umbrella` (the default when the config has umbrellas), `components`, `all` or `none`. Without umbrellas nothing is created until you set it.
+
+- The platform is detected from the remote URL. For other hosts set `MONO_RELEASE_FORGE=github` or `gitlab`.
+- GitHub needs `GITHUB_TOKEN` (or `GH_TOKEN`). GitLab needs `GITLAB_TOKEN`, or uses `CI_JOB_TOKEN` inside GitLab CI.
+- Pre-release versions are marked as pre-releases on GitHub.
+- An already existing release is skipped, so a re-run is harmless.
+- If `releases` is not set and no token is found, a note is printed and the run continues. If `releases` is set explicitly, a missing token is an error.
+
+### Shell completion
+
+```sh
+source <(monorelease completion bash)         # or add it to ~/.bashrc
+monorelease completion zsh > "${fpath[1]}/_monorelease"
+monorelease completion fish | source
+```
+
+Commands, flags and the component and umbrella names from your configuration are completed.
+
 ## Versioning rules
 
 **Bump** is derived from [Conventional Commits](https://www.conventionalcommits.org/):
@@ -145,7 +251,13 @@ On a pre-release branch the pre-release versions are shown (`1.5.0-beta.2`), on 
 | `feat!:` or a `BREAKING CHANGE:` footer | major |
 | anything else | none |
 
-The highest bump among the relevant commits wins. A commit is relevant to a component when it changes a file matching its `paths` and not matching `exclude`.
+The highest bump among the relevant commits wins. A commit is relevant to a component when it changes a file matching its `paths` and not matching `exclude`, **or** when its scope names the component.
+
+**Scopes.** `feat(orders): ...` counts for the component `orders` even if the commit changed nothing under its `paths`. A scope may list several components (`feat(orders, billing): ...`), and a component can have aliases in its `scopes` setting, so `feat(api): ...` can point at `orders`. A scope never removes a commit from another component: a commit that touches the paths of a component still counts for it whatever its scope says.
+
+**Skipping.** A commit with `[skip release]` (or `[release skip]`) in its message is ignored completely: it never causes a release or raises a bump, whatever its type, and it does not appear in the notes.
+
+**Forcing.** `monorelease release --force orders` releases `orders` even though it has no significant commits, with a patch bump; `--force orders=minor` chooses the bump. A forced bump never lowers what the commits already require, and the cascade and umbrellas follow from a forced release as from any other.
 
 **First release.** A component with no tags is released as `initial_version`, whatever the bump. A component without any significant commit is not released.
 
@@ -171,11 +283,16 @@ An example GitLab CI job is in [examples/gitlab-ci.yml](examples/gitlab-ci.yml).
 - Pre-release branches need to see the stable branch: `git fetch origin main --tags`.
 - A token that can push tags (`write_repository`) in the job's `origin` URL.
 - Run `monorelease plan` before `monorelease release --push` so the decision is visible in the log.
+- Keep the notes files as artifacts (`artifacts: paths: [out/]` in the example).
+
+**Docker.** The [Dockerfile](Dockerfile) builds an Alpine image with `monorelease` and git (about 45 MB): `docker build -t monorelease .`. In GitLab CI use `image: { name: ..., entrypoint: [""] }` so the job script can run.
+
+**GitHub Actions.** The repository is also a Docker action ([action.yml](action.yml)); an example workflow is in [examples/github-actions.yml](examples/github-actions.yml). It needs `fetch-depth: 0` and passes `GITHUB_TOKEN` for the releases. The action is a first sketch: it builds the image on every run, and there is no published action version yet.
 
 
 ## Adopting it in an existing repository
 
-mono-release only looks at tags named `<component>@<version>`; other tags (for example semantic-release's `v1.2.3`) are ignored. In a repository with history and no such tags, every component with significant commits would be released as `initial_version`. To continue from your current versions, tag the commit that corresponds to each current version first:
+mono-release only looks at tags named `<component>@<version>` (for example `orders@2.7.0`); the format is fixed, and other tags (for example semantic-release's `v1.2.3`) are ignored. In a repository with history and no such tags, every component with significant commits would be released as `initial_version`. To continue from your current versions, tag the commit that corresponds to each current version first:
 
 ```sh
 git tag -a orders@2.7.0 -m baseline <commit-of-that-release>
@@ -188,9 +305,8 @@ Only commits after those tags are considered from then on.
 ## Limitations
 
 - Versions live in git tags only. mono-release does not edit version fields in files such as `pom.xml` or `package.json` and does not create commits.
-- It does not generate a changelog file yet. `monorelease plan --json` lists the commits behind each release.
+- Notes and changelogs are generated into files in the working tree; they are not committed back to the repository.
 - Release branches for maintaining old versions (such as `release/1.x`) are not supported yet.
-
 - GitLab CI is the reference environment. The tool itself only needs git, so other CI systems work too, but there are no ready-made integrations.
 
 ## Roadmap
@@ -207,7 +323,34 @@ go build ./...
 go test ./...
 ```
 
-Tests run against real temporary git repositories. Set `MONO_RELEASE_TRACE=1` to see the git calls the tool makes.
+Tests run against real temporary git repositories. Set `MONO_RELEASE_TRACE=1` to see the git calls the tool makes. `make build` builds `./monorelease` with the version from the nearest tag; `make test` runs vet and the tests.
+
+## Releasing
+
+mono-release versions itself with mono-release: the configuration is [mono-release.yaml](mono-release.yaml), the tags are `monorelease@1.2.3`, and the history of every release is in [CHANGELOG.md](CHANGELOG.md). The next version follows from the commit messages, so write them as [Conventional Commits](https://www.conventionalcommits.org/): `feat:` for a new feature, `fix:` for a bug fix, `feat!:` for a breaking change. Commits that only change documentation, tests or this repository's tooling do not cause a release.
+
+```sh
+scripts/release.sh          # or: make release
+```
+
+The script runs the tests, shows the plan, and after confirmation pushes the commits, tags the version, regenerates `CHANGELOG.md` and commits it (marked `[skip release]`, so it does not trigger another release), and creates the GitHub release. It reads a GitHub token from `GITHUB_TOKEN` or `gh auth token`. `monorelease --version` shows the version of a build: the release version for release builds, and `0.1.1-3-g1a2b3c4` (three commits after `v0.1.1`) for a checkout.
+
+### Release artifacts
+
+After a release, build the files to attach to the GitHub release:
+
+```sh
+scripts/build-release.sh                  # or: make dist
+```
+
+It builds from the release tag, not from the working tree, so the artifacts are exactly what was released, and writes to `dist/`:
+
+- `monorelease_<version>_<os>_<arch>.tar.gz` for linux and darwin, `.zip` for windows, each for amd64 and arm64, with the license and README;
+- `checksums.txt` with the SHA-256 of every archive;
+- `RELEASE_NOTES.md`, the notes of the release as text for the release page;
+- the Docker image `monorelease:<version>` (and `:latest` for a stable version), built for this machine's platform.
+
+Upload the files in `dist/` to the GitHub release (`gh release upload monorelease@<version> dist/*.tar.gz dist/*.zip dist/checksums.txt`). To publish a multi-architecture image (`linux/amd64` and `linux/arm64`), log in to the registry and run `scripts/build-release.sh --push ghcr.io/re-dream-it/monorelease`. Other options: `--version 0.2.0` for an older release, `--no-docker` for archives only, `--snapshot` to try the build on the working tree. The script needs Go, `git`, `tar`, `zip` and, unless `--no-docker`, Docker.
 
 ## License
 

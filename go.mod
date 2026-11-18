@@ -1,4 +1,4 @@
-module mono-release
+module github.com/re-dream-it/mono-release
 
 go 1.27.4
 

@@ -1,0 +1,33 @@
+# Example: releasing from GitHub Actions with the action from this repository.
+# The action builds the Alpine image from the Dockerfile on every run.
+
+name: release
+on:
+  push:
+    branches: [main, beta]
+
+permissions:
+  contents: write            # push tags and create releases
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # full history, otherwise tags and commits cannot be found
+
+      - name: Make the stable branch visible from pre-release branches
+        run: git fetch origin main --tags
+
+      - name: Plan
+        uses: re-dream-it/mono-release@main
+        with:
+          args: plan
+
+      - name: Release
+        uses: re-dream-it/mono-release@main
+        with:
+          args: release --push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # used to create GitHub releases

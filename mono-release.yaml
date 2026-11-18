@@ -1,0 +1,21 @@
+# mono-release versions itself with mono-release.
+# Release with scripts/release.sh (or `make release`); see "Releasing" in the README.
+
+initial_version: 0.1.0
+
+branches:
+  - {name: main}
+
+components:
+  monorelease:
+    paths: [cmd/**, internal/**, go.mod, go.sum, Dockerfile, docker/**, action.yml]
+    exclude: ["**/*_test.go"]    # a change that only touches tests is not a release
+
+# A GitHub release for every new version, with the notes as its text.
+releases: components
+
+# CHANGELOG.md is generated from the tags and commits; scripts/release.sh commits it.
+notes:
+  - for: monorelease
+    file: CHANGELOG.md
+    history: all

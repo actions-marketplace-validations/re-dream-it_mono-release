@@ -4,6 +4,7 @@
 # Version of the first release of a component that has no tags yet (default 1.0.0).
 initial_version: 1.0.0
 
+
 # Release branches (optional). Without this block every branch releases stable versions.
 # If the block is set and the current branch is not listed, commands stop with an error.
 branches:
@@ -27,6 +28,8 @@ components:
       - "**/*.md"
     depends_on: [common-lib]   # releasing common-lib also releases orders
     # cascade is not set: defaults to patch
+    scopes: [api]              # "feat(api): ..." counts for orders even outside its paths
+                               # (the scope "orders" always works without being listed)
 
   billing:
     paths:
@@ -49,3 +52,16 @@ umbrellas:
   # the same with an explicit list:
   # core:
   #   members: [orders, billing, common-lib]
+
+# Which tags get a GitHub/GitLab release page on `monorelease release --push`:
+# umbrella (the default when there are umbrellas), components, all or none.
+releases: umbrella
+
+# Release notes. `monorelease release` writes these files after tagging. They are written into
+# the working tree and not committed: keep them as CI artifacts.
+notes:
+  - for: platform                              # the newest release of the umbrella
+    file: out/release-notes-{name}-{version}.md
+  - for: "*"                                   # a changelog of every release of every component and umbrella
+    file: out/changelog-{name}.md
+    history: all

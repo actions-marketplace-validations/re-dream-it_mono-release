@@ -1,0 +1,17 @@
+name: mono-release
+description: Version and release the components of a monorepo from their Conventional Commits.
+author: re-dream-it
+branding:
+  icon: tag
+  color: blue
+
+inputs:
+  args:
+    description: 'Arguments for monorelease, for example "plan" or "release --push".'
+    required: false
+    default: plan
+
+runs:
+  using: docker
+  image: Dockerfile
+  entrypoint: /usr/local/bin/action-entrypoint

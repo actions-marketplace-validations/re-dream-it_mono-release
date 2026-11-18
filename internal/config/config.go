@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -11,16 +12,33 @@ import (
 	"github.com/bmatcuk/doublestar/v4"
 	"gopkg.in/yaml.v3"
 
-	"mono-release/internal/graph"
+	"github.com/re-dream-it/mono-release/internal/graph"
 )
 
 type Config struct {
 	// InitialVersion is used for a component's first release.
 	InitialVersion string `yaml:"initial_version"`
+	// Releases says for which tags a GitHub/GitLab Release is created: umbrella, components, all or none.
+	// Empty means umbrella when the config has umbrellas, otherwise none.
+	Releases string `yaml:"releases"`
+	// RepositoryURL is the web URL used for commit links in release notes; derived from the remote when empty.
+	RepositoryURL string `yaml:"repository_url"`
+	// Notes lists which release notes are generated and where they are written.
+	Notes []NotesEntry `yaml:"notes"`
 	// Branches maps release branches to channels. Empty means every branch releases stable versions.
 	Branches   []Branch             `yaml:"branches"`
 	Components map[string]Component `yaml:"components"`
 	Umbrellas  map[string]Umbrella  `yaml:"umbrellas"`
+}
+
+// NotesEntry configures generated release notes: for which component or umbrella, and into which file.
+type NotesEntry struct {
+	// For is a component or umbrella name, or "*" for all of them.
+	For string `yaml:"for"`
+	// File is the output path relative to the repository. {name} and {version} are replaced.
+	File string `yaml:"file"`
+	// History is "latest" (default: only the newest release) or "all" (a changelog of every release).
+	History string `yaml:"history"`
 }
 
 // Branch describes a release branch. Name may be a glob ("release/*").
@@ -79,6 +97,9 @@ type Component struct {
 	DependsOn []string `yaml:"depends_on"`
 	// Cascade is the bump applied when a dependency is released: patch (default), minor or none.
 	Cascade string `yaml:"cascade"`
+	// Scopes are extra Conventional Commit scopes that point at this component, besides its own name:
+	// "feat(api): ..." counts for the component when "api" is listed here, even outside its paths.
+	Scopes []string `yaml:"scopes"`
 }
 
 func Load(path string) (*Config, error) {
@@ -119,6 +140,11 @@ func (c *Config) validate() error {
 	if len(c.Components) == 0 {
 		return fmt.Errorf("config: no components defined")
 	}
+	switch c.Releases {
+	case "", "umbrella", "components", "all", "none":
+	default:
+		return fmt.Errorf("releases must be umbrella, components, all or none, got %q", c.Releases)
+	}
 	for _, name := range c.Names() {
 		comp := c.Components[name]
 		if strings.ContainsAny(name, "@ /\t") {
@@ -150,6 +176,9 @@ func (c *Config) validate() error {
 		}
 	}
 	if _, err := graph.Topo(c.Deps()); err != nil {
+		return err
+	}
+	if err := c.validateNotes(); err != nil {
 		return err
 	}
 	for name, u := range c.Umbrellas {
@@ -191,4 +220,79 @@ func (c *Config) UmbrellaNames() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// Tags are always named "<name>@<version>", for components and umbrellas alike. The format is fixed on
+// purpose: everything that looks versions up (the planner, version, manifest, notes) relies on it.
+
+// TagName returns the tag name for a component or umbrella version: "orders@1.4.0".
+func (c *Config) TagName(name, version string) string {
+	return c.TagPrefix(name) + version
+}
+
+// TagPrefix returns the part of the tag name before the version: "orders@".
+func (c *Config) TagPrefix(name string) string {
+	return name + "@"
+}
+
+// ScopeMatches reports whether one of the commit scopes points at the component: its own name or an alias.
+func (c *Config) ScopeMatches(component string, scopes []string) bool {
+	comp := c.Components[component]
+	for _, sc := range scopes {
+		if sc == component {
+			return true
+		}
+		for _, alias := range comp.Scopes {
+			if sc == alias {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ReleaseTargets resolves the "releases" setting: which tags get a GitHub/GitLab Release.
+func (c *Config) ReleaseTargets() (umbrellas, components bool) {
+	switch c.Releases {
+	case "umbrella":
+		return true, false
+	case "components":
+		return false, true
+	case "all":
+		return true, true
+	case "none":
+		return false, false
+	}
+	return len(c.Umbrellas) > 0, false // default: umbrellas only, and only if there are any
+}
+
+func (c *Config) validateNotes() error {
+	for i, n := range c.Notes {
+		where := fmt.Sprintf("notes[%d]", i)
+		if n.For != "*" {
+			_, isComp := c.Components[n.For]
+			_, isUmb := c.Umbrellas[n.For]
+			if !isComp && !isUmb {
+				return fmt.Errorf("%s: unknown component or umbrella %q", where, n.For)
+			}
+		}
+		if n.File == "" {
+			return fmt.Errorf("%s: file must not be empty", where)
+		}
+		if path.IsAbs(n.File) || n.File != path.Clean(n.File) || strings.HasPrefix(n.File, "..") {
+			return fmt.Errorf("%s: file %q must be a clean relative path inside the repository", where, n.File)
+		}
+		switch n.History {
+		case "", "latest", "all":
+		default:
+			return fmt.Errorf("%s: history must be latest or all, got %q", where, n.History)
+		}
+		if n.For == "*" && !strings.Contains(n.File, "{name}") {
+			return fmt.Errorf("%s: file must contain {name} when for is \"*\"", where)
+		}
+		if n.History == "all" && strings.Contains(n.File, "{version}") {
+			return fmt.Errorf("%s: file must not contain {version} when history is all", where)
+		}
+	}
+	return nil
 }
