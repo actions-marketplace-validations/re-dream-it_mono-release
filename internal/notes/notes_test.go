@@ -250,3 +250,61 @@ func TestWebURL(t *testing.T) {
 		}
 	}
 }
+
+// The notes of a stable version cover everything since the previous STABLE version (including the work
+// done in its pre-releases); the notes of a pre-release cover only what is new since the previous version.
+func TestPrereleaseNotes(t *testing.T) {
+	dir := t.TempDir()
+	run(t, dir, "init", "-q", "-b", "main")
+	run(t, dir, "config", "user.email", "t@t")
+	run(t, dir, "config", "user.name", "t")
+	commit(t, dir, "services/orders/a", "feat: first")
+	tag(t, dir, "orders@1.0.0", "")
+	commit(t, dir, "services/orders/b", "feat: in beta one")
+	tag(t, dir, "orders@1.1.0-beta.1", "")
+	commit(t, dir, "services/orders/c", "fix: in beta two")
+	tag(t, dir, "orders@1.1.0-beta.2", "")
+	commit(t, dir, "services/orders/d", "fix: after the last beta")
+	tag(t, dir, "orders@1.1.0", "")
+
+	cfg, err := config.Parse([]byte(cfgYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := &Generator{Cfg: cfg, Git: git.New(dir)}
+
+	stable, err := g.Notes("orders", "1.1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustContain(t, stable, "in beta one", "in beta two", "after the last beta")
+	mustNotContain(t, stable, "first")
+
+	beta2, _ := g.Notes("orders", "1.1.0-beta.2")
+	mustContain(t, beta2, "in beta two")
+	mustNotContain(t, beta2, "in beta one", "after the last beta")
+
+	beta1, _ := g.Notes("orders", "1.1.0-beta.1")
+	mustContain(t, beta1, "in beta one")
+	mustNotContain(t, beta1, "in beta two")
+
+	// ordering: 1.1.0-beta.2 is older than 1.1.0 but newer than 1.1.0-beta.1
+	if vs, _ := g.Releases("orders"); len(vs) != 4 || vs[1] != "1.1.0-beta.1" || vs[2] != "1.1.0-beta.2" || vs[3] != "1.1.0" {
+		t.Errorf("order: %v", vs)
+	}
+}
+
+// A lightweight tag (or a tag whose message is not a manifest) for an umbrella is a clear error, not a crash.
+func TestUmbrellaWithoutManifest(t *testing.T) {
+	dir := t.TempDir()
+	run(t, dir, "init", "-q", "-b", "main")
+	run(t, dir, "config", "user.email", "t@t")
+	run(t, dir, "config", "user.name", "t")
+	commit(t, dir, "services/orders/a", "feat: x")
+	run(t, dir, "tag", "platform@1.0.0") // lightweight: its "message" is the commit message
+	cfg, _ := config.Parse([]byte(cfgYAML))
+	g := &Generator{Cfg: cfg, Git: git.New(dir)}
+	if _, err := g.Notes("platform", "1.0.0"); err == nil {
+		t.Error("expected an error for a tag without a manifest")
+	}
+}

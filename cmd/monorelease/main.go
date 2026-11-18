@@ -44,12 +44,16 @@ flags:
   --remote <name>    remote for --push and for commit links (default origin)
   --no-notes         release: do not write the configured notes files
   --no-releases      release: do not create GitHub/GitLab releases
+  --allow-shallow    work on a shallow clone anyway (versions may be wrong, see below)
+
+A shallow clone (git clone --depth N, GitLab CI's default) lacks history and tags, so monorelease refuses
+to run on it: fetch the full history (git fetch --unshallow --tags; in GitLab CI set GIT_DEPTH: "0").
 `
 
 type options struct {
 	cfgPath, dir, branch, ref, remote, component, base string
 	asJSON, push, stable, withDependents               bool
-	write, all, noNotes, noReleases                    bool
+	write, all, noNotes, noReleases, allowShallow      bool
 	force                                              multiFlag
 	args                                               []string // positional arguments
 }
@@ -86,6 +90,7 @@ func main() {
 	fs.BoolVar(&o.write, "write", false, "notes: write files")
 	fs.BoolVar(&o.all, "all", false, "notes: whole changelog")
 	fs.BoolVar(&o.noNotes, "no-notes", false, "release: skip notes files")
+	fs.BoolVar(&o.allowShallow, "allow-shallow", false, "work on a shallow clone anyway")
 	fs.BoolVar(&o.noReleases, "no-releases", false, "release: skip GitHub/GitLab releases")
 	fs.Var(&o.force, "force", "force a release: name or name=bump")
 
@@ -169,6 +174,11 @@ func setup(cmd string, o options) (*config.Config, *git.CLI, planner.Options, er
 	}
 	g := git.New(o.dir)
 	g.Ref = o.ref
+	if !o.allowShallow && g.IsShallow() {
+		return nil, nil, planner.Options{}, fmt.Errorf("this is a shallow clone: its history and tags are incomplete, so the versions would be wrong " +
+			"(a component would be released as its first version again). Fetch the full history with \"git fetch --unshallow --tags\" " +
+			"(in GitLab CI set GIT_DEPTH: \"0\"), or pass --allow-shallow to continue at your own risk")
+	}
 	force, err := parseForce(o.force)
 	if err != nil {
 		return nil, nil, planner.Options{}, err

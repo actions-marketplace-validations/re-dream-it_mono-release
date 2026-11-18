@@ -584,3 +584,58 @@ func TestTagNames(t *testing.T) {
 		t.Errorf("manifest: %q", m)
 	}
 }
+
+func TestPathSpellings(t *testing.T) {
+	cfg := mustCfg(t, `
+components:
+  dot:     {paths: ["./svc/dot/**"]}
+  slash:   {paths: ["svc/slash/"]}
+  dirname: {paths: ["svc/dirname"]}
+  file:    {paths: ["tools/Makefile"]}
+  excl:    {paths: ["svc/excl"], exclude: ["svc/excl/docs", "**/*.md"]}
+`)
+	f := fake{commits: []git.Commit{
+		{SHA: "1", Subject: "feat: a", Files: []string{"svc/dot/a.go"}},
+		{SHA: "2", Subject: "feat: b", Files: []string{"svc/slash/deep/b.go"}},
+		{SHA: "3", Subject: "feat: c", Files: []string{"svc/dirname/c.go"}},
+		{SHA: "4", Subject: "feat: d", Files: []string{"tools/Makefile"}},
+		{SHA: "5", Subject: "feat: e", Files: []string{"svc/excl/docs/readme.txt", "svc/excl/NOTES.md"}}, // both excluded
+	}}
+	plan, err := Build(cfg, f, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := releasesOf(plan)
+	for _, name := range []string{"dot", "slash", "dirname", "file"} {
+		if got[name] != "->1.0.0" {
+			t.Errorf("%s should be released: %v", name, got)
+		}
+	}
+	if _, ok := got["excl"]; ok {
+		t.Errorf("excluded files (a directory name and a glob) must not release excl: %v", got)
+	}
+	// "tools/Makefile" is a file, not a directory: a similar name must not match
+	f2 := fake{commits: []git.Commit{{SHA: "6", Subject: "feat: f", Files: []string{"tools/Makefile.bak", "svc/dirname2/x"}}}}
+	plan, _ = Build(cfg, f2, Options{})
+	if len(plan.Releases) != 0 {
+		t.Errorf("look-alike names must not match: %v", releasesOf(plan))
+	}
+}
+
+func TestMergeCommitsAreNotCounted(t *testing.T) {
+	cfg := mustCfg(t, "components:\n a: {paths: [a/**]}\n")
+	f := fake{versions: map[string]string{"a": "1.0.0"}, commits: []git.Commit{
+		{SHA: "m", Subject: "Merge branch 'x' into 'main'", Files: []string{"a/f"}},
+		{SHA: "c", Subject: "fix: real change", Files: []string{"a/f"}},
+	}}
+	plan, err := Build(cfg, f, Options{Explain: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(plan.Releases[0].Changes); n != 1 {
+		t.Errorf("only the real commit counts, got %d changes", n)
+	}
+	if n := len(plan.Details["a"].Considered); n != 1 {
+		t.Errorf("explain must not list the merge commit, got %d", n)
+	}
+}

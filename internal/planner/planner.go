@@ -378,6 +378,9 @@ func Build(cfg *config.Config, r git.Reader, opt Options) (*Plan, error) {
 		max, freshMax := commits.None, commits.None
 		skipped := 0
 		for _, c := range all {
+			if commits.IsMerge(c.Subject) {
+				continue // a merge says nothing about the change; the commits it brings in are counted themselves
+			}
 			p := commits.Parse(c.Subject, c.Body)
 			via := Relevance(cfg, name, c, p)
 			if via == "" {
@@ -618,9 +621,14 @@ func touches(c config.Component, files []string) bool {
 	return false
 }
 
+// matchAny reports whether the file matches one of the glob patterns. A pattern that names a directory
+// ("services/orders" or "services/orders/") also covers everything inside it.
 func matchAny(patterns []string, file string) bool {
 	for _, p := range patterns {
 		if ok, _ := doublestar.Match(p, file); ok {
+			return true
+		}
+		if ok, _ := doublestar.Match(strings.TrimSuffix(p, "/")+"/**", file); ok {
 			return true
 		}
 	}

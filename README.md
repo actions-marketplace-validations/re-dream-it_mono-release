@@ -100,7 +100,7 @@ The configuration lives in `mono-release.yaml` in the repository root (override 
 | `notes[].history` | `latest` (default): notes of the newest release. `all`: a changelog of every release. |
 | `branches[].name` | Release branch. May be a glob such as `rc/*`. |
 | `branches[].prerelease` | Pre-release channel of the branch (`beta`, `rc`, ...). Empty or omitted means stable releases. |
-| `components.<name>.paths` | Glob patterns of the files that belong to the component. A component may span several directories. Required. |
+| `components.<name>.paths` | Glob patterns of the files that belong to the component. A component may span several directories. A pattern that names a directory (`services/orders` or `services/orders/`) covers everything inside it. Required. |
 | `components.<name>.exclude` | Glob patterns of files that do not count as a change of the component. |
 | `components.<name>.depends_on` | Components this one depends on. Releasing a dependency also releases this component. |
 | `components.<name>.cascade` | Bump applied when a dependency is released: `patch` (default), `minor` or `none`. |
@@ -111,7 +111,7 @@ The configuration lives in `mono-release.yaml` in the repository root (override 
 Rules:
 
 - Component and umbrella names must not contain `@`, `/` or whitespace, and must not clash with each other.
-- `paths` and `exclude` are glob patterns (`**` is supported).
+- `paths` and `exclude` are glob patterns relative to the repository root (`**` is supported). A leading `./` is ignored; an absolute pattern or one that climbs out with `..` is an error.
 - Unknown fields, unknown dependencies, dependency cycles and an umbrella with both `all` and `members` are configuration errors.
 - If `branches` is set and the current branch is not listed, commands stop with an error instead of releasing from an unexpected branch.
 
@@ -166,7 +166,7 @@ monorelease manifest platform --component orders   # orders' version in the late
 
 On a pre-release branch the pre-release versions are shown (`1.5.0-beta.2`), on a stable branch only stable ones. `--stable` always gives stable versions. A component without releases is printed as `(none)` in the list and makes `version <name>` exit with status 1. The manifest is stored in the message of the umbrella's tag, so `manifest` works for tags created by `monorelease release`.
 
-`release --push` pushes all new tags in a single atomic push.
+`release --push` pushes all new tags in a single atomic push. If the tags cannot be pushed (a protected tag, a rejected push, another run that released first), the tags created locally are removed again, so a retry plans the same release instead of believing it was already done.
 
 ### What changed (for CI)
 
@@ -234,12 +234,12 @@ With `release --push`, mono-release can create a release page for each new tag, 
 - GitHub needs `GITHUB_TOKEN` (or `GH_TOKEN`). GitLab needs `GITLAB_TOKEN`, or uses `CI_JOB_TOKEN` inside GitLab CI.
 - Pre-release versions are marked as pre-releases on GitHub.
 - An already existing release is skipped, so a re-run is harmless.
-- If `releases` is not set and no token is found, a note is printed and the run continues. If `releases` is set explicitly, a missing token is an error.
+- If `releases` is not set and no release page can be created (no token, or a remote that is not GitHub or GitLab), a note is printed and the run continues. If `releases` is set explicitly, a missing token is an error.
 
 ### Shell completion
 
 ```sh
-source <(monorelease completion bash)         # or add it to ~/.bashrc
+eval "$(monorelease completion bash)"        # or add this line to ~/.bashrc
 monorelease completion zsh > "${fpath[1]}/_monorelease"
 monorelease completion fish | source
 ```
@@ -279,13 +279,13 @@ The highest bump among the relevant commits wins. A commit is relevant to a comp
 - Which stable version is "latest" is determined from the **stable branches** in the config (the local branch and `origin/<name>`), not just the history of the current branch. You do not need to merge the stable branch back into a pre-release branch for it to notice a new stable release.
 - Pre-release tags of other channels are ignored; on a stable branch all pre-release tags are ignored.
 
-**Merge strategies.** Fast-forward, squash and merge commits all work. Commits brought in by a merge count as ordinary commits, so a merge commit with a non-conventional title (such as GitLab's default `Merge branch 'x' into 'main'`) is harmless when the commits inside are conventional. A merge commit is also evaluated by what it brought into the branch, which covers the case where only the merge title is conventional.
+**Merge strategies.** Fast-forward, squash and merge commits all work. Commits brought in by a merge count as ordinary commits, so a merge commit with a non-conventional title (such as GitLab's default `Merge branch 'x' into 'main'`) is harmless when the commits inside are conventional. A merge commit is also evaluated by what it brought into the branch, which covers the case where only the merge title is conventional. The default merge messages (`Merge branch ...`, `Merge pull request ...`) are not listed as changes themselves.
 
 ## Using it in CI
 
 An example GitLab CI job is in [examples/gitlab-ci.yml](examples/gitlab-ci.yml). Things to get right:
 
-- Full history: `GIT_DEPTH: "0"`.
+- Full history: `GIT_DEPTH: "0"`. On a shallow clone (`git clone --depth N`, which GitLab CI does by default) tags and history are missing, so every component would be released as its first version again. monorelease refuses to run on one and says how to fix it (`git fetch --unshallow --tags`); `--allow-shallow` overrides the check at your own risk.
 - Pre-release branches need to see the stable branch: `git fetch origin main --tags`.
 - A token that can push tags (`write_repository`) in the job's `origin` URL.
 - Run `monorelease plan` before `monorelease release --push` so the decision is visible in the log.

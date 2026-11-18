@@ -275,7 +275,7 @@ type entry struct {
 func (g *Generator) groups(name string, cs []git.Commit) string {
 	var items []entry
 	for _, c := range cs {
-		if isMerge(c.Subject) {
+		if commits.IsMerge(c.Subject) {
 			continue
 		}
 		p := commits.Parse(c.Subject, c.Body)
@@ -322,11 +322,6 @@ func (g *Generator) groups(name string, cs []git.Commit) string {
 		fmt.Fprintf(&b, "<details><summary>Other changes (%d)</summary>\n\n%s\n\n</details>\n", len(other), strings.Join(other, "\n"))
 	}
 	return strings.TrimRight(b.String(), "\n") + "\n"
-}
-
-func isMerge(subject string) bool {
-	return strings.HasPrefix(subject, "Merge branch ") || strings.HasPrefix(subject, "Merge pull request ") ||
-		strings.HasPrefix(subject, "Merge remote-tracking branch ")
 }
 
 func (g *Generator) commitLink(sha string) string {

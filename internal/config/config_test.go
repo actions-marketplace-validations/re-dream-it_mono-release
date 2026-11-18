@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestValidate(t *testing.T) {
 	bad := map[string]string{
@@ -118,6 +121,25 @@ func TestNotesValidation(t *testing.T) {
 	for _, n := range bad {
 		if _, err := Parse([]byte(n + base)); err == nil {
 			t.Errorf("should be rejected:\n%s", n)
+		}
+	}
+}
+
+func TestPatternNormalization(t *testing.T) {
+	c, err := Parse([]byte("components:\n a: {paths: ['./svc/a/**', '././svc/b', ' svc/c/ '], exclude: ['./**/*.md']}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := c.Components["a"]
+	if got := strings.Join(a.Paths, "|"); got != "svc/a/**|svc/b|svc/c/" {
+		t.Errorf("paths: %s", got)
+	}
+	if got := strings.Join(a.Exclude, "|"); got != "**/*.md" {
+		t.Errorf("exclude: %s", got)
+	}
+	for _, bad := range []string{"/abs/path/**", "../outside/**", "a/../b/**", "..", "./", "' '"} {
+		if _, err := Parse([]byte("components:\n a: {paths: [" + bad + "]}\n")); err == nil {
+			t.Errorf("pattern %s should be rejected", bad)
 		}
 	}
 }

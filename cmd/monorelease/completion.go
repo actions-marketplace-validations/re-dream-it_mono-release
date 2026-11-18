@@ -28,7 +28,7 @@ func cmdCompletion(args []string) error {
 	return nil
 }
 
-var bashCompletion = `# bash completion for monorelease. Load it with:  source <(monorelease completion bash)
+var bashCompletion = `# bash completion for monorelease. Load it with:  eval "$(monorelease completion bash)"
 _monorelease() {
   local cur prev cmd
   COMPREPLY=()

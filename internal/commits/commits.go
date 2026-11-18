@@ -61,3 +61,11 @@ func Parse(subject, body string) Parsed {
 	}
 	return p
 }
+
+// IsMerge reports whether a commit subject is the default message of a merge ("Merge branch 'x' into
+// 'main'", "Merge pull request #1 ..."). Such commits say nothing about the change: what matters are
+// the commits they bring in.
+func IsMerge(subject string) bool {
+	return strings.HasPrefix(subject, "Merge branch ") || strings.HasPrefix(subject, "Merge pull request ") ||
+		strings.HasPrefix(subject, "Merge remote-tracking branch ")
+}

@@ -380,3 +380,126 @@ func TestCreateTagRefreshesCachedTags(t *testing.T) {
 		t.Errorf("a tag created after the first read must be visible: %v", tags)
 	}
 }
+
+func TestShallowAndDeleteTags(t *testing.T) {
+	d, g := newRepo(t)
+	commitFile(t, d, "f", "one")
+	commitFile(t, d, "g", "two")
+	if g.IsShallow() {
+		t.Error("a normal repository is not shallow")
+	}
+	clone := t.TempDir()
+	if out, err := exec.Command("git", "clone", "-q", "--depth", "1", "file://"+d, clone).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if !New(clone).IsShallow() {
+		t.Error("a --depth 1 clone is shallow")
+	}
+
+	head, _ := g.Head()
+	for _, n := range []string{"a@1.0.0", "b@1.0.0", "c@1.0.0"} {
+		if err := g.CreateTag(n, head, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if tags, _ := g.Tags("a@", ""); len(tags) != 1 { // fill the cache
+		t.Fatal("setup")
+	}
+	if err := g.DeleteTags([]string{"a@1.0.0", "b@1.0.0"}); err != nil {
+		t.Fatal(err)
+	}
+	if tags, _ := g.Tags("a@", ""); len(tags) != 0 {
+		t.Errorf("deleted tag still visible through the cache: %v", tags)
+	}
+	if tags, _ := g.Tags("c@", ""); len(tags) != 1 {
+		t.Errorf("other tags must stay: %v", tags)
+	}
+	if err := g.DeleteTags(nil); err != nil {
+		t.Errorf("deleting nothing must be a no-op: %v", err)
+	}
+}
+
+// Between served from the cached graph must equal "git rev-list from..to" for every pair of commits,
+// in a history with merges (where "reachable from" is easy to get wrong).
+func TestBetweenInMemoryMatchesRevList(t *testing.T) {
+	d, g := newRepo(t)
+	commitFile(t, d, "a", "c1")
+	sh(t, d, "checkout", "-qb", "side")
+	commitFile(t, d, "s1", "s1")
+	commitFile(t, d, "s2", "s2")
+	sh(t, d, "checkout", "-q", "main")
+	commitFile(t, d, "m2", "m2")
+	sh(t, d, "merge", "-q", "--no-ff", "side", "-m", "merge side")
+	commitFile(t, d, "m3", "m3")
+	sh(t, d, "checkout", "-qb", "other", "main~2") // a branch that is NOT in main's history
+	commitFile(t, d, "o1", "o1")
+	sh(t, d, "checkout", "-q", "main")
+
+	revs := func(args ...string) []string {
+		out, err := exec.Command("git", append([]string{"-C", d}, args...)...).Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Fields(string(out))
+	}
+	all := revs("rev-list", "main")
+	for _, from := range append([]string{""}, all...) {
+		for _, to := range all {
+			want := revs("rev-list", map[bool]string{true: to, false: from + ".." + to}[from == ""])
+			got, err := g.Between(from, to)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var gotSHAs []string
+			for _, c := range got {
+				gotSHAs = append(gotSHAs, c.SHA)
+			}
+			sort.Strings(gotSHAs)
+			sort.Strings(want)
+			if !reflect.DeepEqual(gotSHAs, want) && !(len(gotSHAs) == 0 && len(want) == 0) {
+				t.Fatalf("Between(%.7s, %.7s):\n got %v\nwant %v", from, to, gotSHAs, want)
+			}
+		}
+	}
+	// a commit outside the ref's history falls back to git
+	other := revs("rev-parse", "other")[0]
+	// "other" is m2 plus o1: relative to the first commit of main that is two commits, found through git
+	if cs, err := g.Between(all[len(all)-1], other); err != nil || len(cs) != 2 || cs[0].Subject != "o1" || cs[1].Subject != "m2" {
+		t.Errorf("fallback for a commit outside the history: %v %v", cs, err)
+	}
+}
+
+func TestTagMetaIsCachedAndRefreshed(t *testing.T) {
+	d, g := newRepo(t)
+	commitFile(t, d, "f", "init")
+	head, _ := g.Head()
+	if err := g.CreateTag("platform@1.0.0", head, "a@1.0.0\nb@2.0.0\n"); err != nil {
+		t.Fatal(err)
+	}
+	g.stats = map[string]*stat{}
+	for i := 0; i < 5; i++ {
+		if msg, ok, _ := g.TagMessage("platform@1.0.0"); !ok || msg != "a@1.0.0\nb@2.0.0" {
+			t.Fatalf("message: %q %v", msg, ok)
+		}
+		if c, date, err := g.TagInfo("platform@1.0.0"); err != nil || c != head || date.IsZero() {
+			t.Fatalf("info: %q %v %v", c, date, err)
+		}
+	}
+	if n := g.stats["for-each-ref"]; n == nil || n.n != 1 {
+		t.Errorf("ten lookups must cost one git call, got %+v", n)
+	}
+	// a tag created later must be visible, and a deleted one gone
+	if err := g.CreateTag("platform@1.1.0", head, "a@1.1.0\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := g.TagMessage("platform@1.1.0"); !ok {
+		t.Error("new tag not visible")
+	}
+	g.DeleteTags([]string{"platform@1.0.0"})
+	if _, ok, _ := g.TagMessage("platform@1.0.0"); ok {
+		t.Error("deleted tag still visible")
+	}
+	if _, _, err := g.TagInfo("platform@1.0.0"); err == nil {
+		t.Error("TagInfo of a deleted tag must fail")
+	}
+}

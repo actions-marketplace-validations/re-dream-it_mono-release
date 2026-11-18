@@ -64,3 +64,18 @@ func TestSkipMarker(t *testing.T) {
 		}
 	}
 }
+
+func TestIsMerge(t *testing.T) {
+	for subject, want := range map[string]bool{
+		"Merge branch 'x' into 'main'":              true,
+		"Merge pull request #12 from a/b":           true,
+		"Merge remote-tracking branch 'origin/dev'": true,
+		"feat: merge two lists":                     false,
+		"merge branch notes":                        false,
+		"Merged results":                            false,
+	} {
+		if got := IsMerge(subject); got != want {
+			t.Errorf("IsMerge(%q) = %v", subject, got)
+		}
+	}
+}

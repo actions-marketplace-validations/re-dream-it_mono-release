@@ -76,12 +76,22 @@ type CLI struct {
 	stats map[string]*stat
 
 	tagMu     sync.Mutex
-	tags      map[string][]Tag  // ref -> every valid-looking version tag (name, parsed later per prefix)
-	tagCommit map[string]string // tag name -> commit
+	tags      map[string][]Tag   // ref -> every valid-looking version tag (name, parsed later per prefix)
+	tagCommit map[string]string  // tag name -> commit
+	meta      map[string]tagMeta // every tag: commit, date and message, read with one git call (nil = not loaded)
 
-	histMu  sync.Mutex
-	lists   map[string][]string // base tag ("" = full history) -> commit SHAs, newest first
-	commits map[string]Commit   // sha -> commit
+	histMu    sync.Mutex
+	lists     map[string][]string // base tag ("" = full history) -> commit SHAs, newest first
+	commits   map[string]Commit   // sha -> commit
+	grOrder   []string            // the commit graph of the ref, read once: SHAs newest first
+	grParents map[string][]string // and each commit's parents
+}
+
+// tagMeta is what is known about one tag.
+type tagMeta struct {
+	commit  string
+	date    time.Time
+	message string
 }
 
 type stat struct {
@@ -265,8 +275,12 @@ func (g *CLI) Commits(sinceTag string) ([]Commit, error) {
 	return res, nil
 }
 
-// graph reads the commit graph of the current ref once: SHAs newest first and each commit's parents.
+// graph returns the commit graph of the current ref: SHAs newest first and each commit's parents.
+// It is read once. The caller must hold histMu.
 func (g *CLI) graph() (order []string, parents map[string][]string, err error) {
+	if g.grParents != nil {
+		return g.grOrder, g.grParents, nil
+	}
 	out, err := g.run("rev-list", "--parents", g.ref())
 	if err != nil {
 		return nil, nil, err
@@ -280,6 +294,7 @@ func (g *CLI) graph() (order []string, parents map[string][]string, err error) {
 		order = append(order, f[0])
 		parents[f[0]] = f[1:]
 	}
+	g.grOrder, g.grParents = order, parents
 	return order, parents, nil
 }
 
@@ -426,19 +441,43 @@ func (g *CLI) loadDetails(shas []string) error {
 	return nil
 }
 
-// Between returns the commits reachable from "to" but not from "from", newest first.
+// Between returns the commits reachable from "to" but not from "from", newest first. When both are
+// commits of the current ref's history (which is what the release notes ask for) the range is computed
+// from the cached commit graph, without a git call per range.
 func (g *CLI) Between(from, to string) ([]Commit, error) {
-	rng := to
-	if from != "" {
-		rng = from + ".." + to
-	}
-	out, err := g.run("rev-list", rng)
+	g.histMu.Lock()
+	defer g.histMu.Unlock()
+
+	var shas []string
+	order, parents, err := g.graph()
 	if err != nil {
 		return nil, err
 	}
-	shas := strings.Fields(out)
-	g.histMu.Lock()
-	defer g.histMu.Unlock()
+	_, toKnown := parents[to]
+	_, fromKnown := parents[from]
+	if toKnown && (from == "" || fromKnown) {
+		in := ancestors(to, parents)
+		if from != "" {
+			for sha := range ancestors(from, parents) {
+				delete(in, sha)
+			}
+		}
+		for _, sha := range order {
+			if in[sha] {
+				shas = append(shas, sha)
+			}
+		}
+	} else {
+		rng := to
+		if from != "" {
+			rng = from + ".." + to
+		}
+		out, err := g.run("rev-list", rng)
+		if err != nil {
+			return nil, err
+		}
+		shas = strings.Fields(out)
+	}
 	var need []string
 	for _, sha := range shas {
 		if _, ok := g.commits[sha]; !ok {
@@ -470,22 +509,45 @@ func (g *CLI) ChangedFiles(base string) ([]string, error) {
 	return files, nil
 }
 
+// loadTagMeta reads commit, date and message of every tag with a single git call. The caller must hold tagMu.
+func (g *CLI) loadTagMeta() error {
+	if g.meta != nil {
+		return nil
+	}
+	out, err := g.run("for-each-ref",
+		"--format=%(refname:strip=2)%1f%(objectname)%1f%(*objectname)%1f%(creatordate:iso-strict)%1f%(contents)%1e", "refs/tags/*")
+	if err != nil {
+		return err
+	}
+	meta := map[string]tagMeta{}
+	for _, rec := range strings.Split(out, "\x1e") {
+		f := strings.SplitN(strings.TrimLeft(rec, "\n"), "\x1f", 5)
+		if len(f) < 5 || f[0] == "" {
+			continue
+		}
+		m := tagMeta{commit: f[1], message: strings.TrimRight(f[4], "\n")}
+		if f[2] != "" {
+			m.commit = f[2] // annotated: the peeled object is the commit
+		}
+		m.date, _ = time.Parse(time.RFC3339, f[3])
+		meta[f[0]] = m
+	}
+	g.meta = meta
+	return nil
+}
+
 // TagInfo returns the commit a tag points to and the tag's date.
 func (g *CLI) TagInfo(tag string) (string, time.Time, error) {
-	out, err := g.run("for-each-ref", "--format=%(objectname) %(*objectname) %(creatordate:iso-strict)", "refs/tags/"+tag)
-	if err != nil {
+	g.tagMu.Lock()
+	defer g.tagMu.Unlock()
+	if err := g.loadTagMeta(); err != nil {
 		return "", time.Time{}, err
 	}
-	f := strings.Fields(out)
-	if len(f) < 2 {
+	m, ok := g.meta[tag]
+	if !ok {
 		return "", time.Time{}, fmt.Errorf("tag %s not found", tag)
 	}
-	commit, dateStr := f[0], f[len(f)-1]
-	if len(f) >= 3 {
-		commit = f[1] // annotated: the peeled object is the commit
-	}
-	t, _ := time.Parse(time.RFC3339, dateStr)
-	return commit, t, nil
+	return m.commit, m.date, nil
 }
 
 // RemoteURL returns the URL of a remote, or "" if there is none.
@@ -504,20 +566,38 @@ func (g *CLI) CreateTag(name, sha, message string) error {
 	_, err := g.run("tag", "-a", name, sha, "-m", message)
 	// the tag lists read so far are stale now
 	g.tagMu.Lock()
-	g.tags = map[string][]Tag{}
+	g.tags, g.meta = map[string][]Tag{}, nil
 	g.tagMu.Unlock()
 	return err
 }
 
 func (g *CLI) TagMessage(tag string) (string, bool, error) {
-	if _, err := g.run("rev-parse", "--verify", "--quiet", "refs/tags/"+tag); err != nil {
-		return "", false, nil
-	}
-	out, err := g.run("for-each-ref", "--format=%(contents)", "refs/tags/"+tag)
-	if err != nil {
+	g.tagMu.Lock()
+	defer g.tagMu.Unlock()
+	if err := g.loadTagMeta(); err != nil {
 		return "", false, err
 	}
-	return strings.TrimRight(out, "\n"), true, nil
+	m, ok := g.meta[tag]
+	return m.message, ok, nil
+}
+
+// IsShallow reports whether the repository is a shallow clone: its history, and with it the tags
+// that are reachable, is incomplete.
+func (g *CLI) IsShallow() bool {
+	out, err := g.run("rev-parse", "--is-shallow-repository")
+	return err == nil && strings.TrimSpace(out) == "true"
+}
+
+// DeleteTags removes local tags, used to undo a release that could not be pushed.
+func (g *CLI) DeleteTags(names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	_, err := g.run(append([]string{"tag", "-d"}, names...)...)
+	g.tagMu.Lock()
+	g.tags, g.meta = map[string][]Tag{}, nil
+	g.tagMu.Unlock()
+	return err
 }
 
 func (g *CLI) PushTags(remote string, names []string) error {

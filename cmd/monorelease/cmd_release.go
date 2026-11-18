@@ -12,21 +12,28 @@ import (
 	"github.com/re-dream-it/mono-release/internal/planner"
 )
 
-// cmdRelease creates the tags of the plan and then, as configured, writes notes files, pushes the
-// tags and creates GitHub/GitLab releases.
+// cmdRelease creates the tags of the plan and then, as configured, pushes them, writes notes files and
+// creates GitHub/GitLab releases. If the tags cannot be created or pushed the local tags are removed
+// again: a tag that exists only locally would make the next run believe the version was released.
 func cmdRelease(cfg *config.Config, g *git.CLI, plan *planner.Plan, o options) error {
 	// component tags first, then umbrella tags (their message holds the member versions)
 	var names []string
+	rollback := func(err error) error {
+		if derr := g.DeleteTags(names); derr != nil {
+			return fmt.Errorf("%w (and the local tags %s could not be removed: %v)", err, strings.Join(names, ", "), derr)
+		}
+		return fmt.Errorf("%w (the local tags were removed again, so a retry plans the same release)", err)
+	}
 	for _, r := range plan.Releases {
 		if err := g.CreateTag(r.Tag, plan.SHA, ""); err != nil {
-			return err
+			return rollback(err)
 		}
 		fmt.Println("tagged", r.Tag)
 		names = append(names, r.Tag)
 	}
 	for _, u := range plan.Umbrellas {
 		if err := g.CreateTag(u.Tag, plan.SHA, u.Manifest()); err != nil {
-			return err
+			return rollback(err)
 		}
 		fmt.Println("tagged", u.Tag)
 		names = append(names, u.Tag)
@@ -34,6 +41,14 @@ func cmdRelease(cfg *config.Config, g *git.CLI, plan *planner.Plan, o options) e
 	if len(names) == 0 {
 		fmt.Println("nothing to release")
 		return nil
+	}
+
+	if o.push {
+		// a single atomic push: either all tags reach the remote or none
+		if err := g.PushTags(o.remote, names); err != nil {
+			return rollback(err)
+		}
+		fmt.Printf("pushed %d tags to %s\n", len(names), o.remote)
 	}
 
 	// notes files are written into the working tree, never committed: publish them as CI artifacts
@@ -47,16 +62,7 @@ func cmdRelease(cfg *config.Config, g *git.CLI, plan *planner.Plan, o options) e
 		}
 	}
 
-	if !o.push {
-		return nil
-	}
-	// a single atomic push: either all tags reach the remote or none
-	if err := g.PushTags(o.remote, names); err != nil {
-		return err
-	}
-	fmt.Printf("pushed %d tags to %s\n", len(names), o.remote)
-
-	if o.noReleases {
+	if !o.push || o.noReleases {
 		return nil
 	}
 	umbrellas, components := cfg.ReleaseTargets()
@@ -76,11 +82,17 @@ func createReleases(cfg *config.Config, g *git.CLI, plan *planner.Plan, o option
 	}
 	client, err := forge.FromEnv(webURL)
 	if err != nil {
-		var noToken forge.ErrNoToken
-		if explicit || !errors.As(err, &noToken) {
+		if explicit {
 			return fmt.Errorf("tags are pushed, but creating releases failed: %w", err)
 		}
-		fmt.Fprintf(os.Stderr, "skipping %s releases: %v\n", noToken.Platform, err)
+		// the default setting must never break a release: a remote that is not GitHub or GitLab, or a
+		// missing token, only means there is no release page to create
+		var noToken forge.ErrNoToken
+		if errors.As(err, &noToken) {
+			fmt.Fprintf(os.Stderr, "skipping %s releases: %v\n", noToken.Platform, err)
+		} else {
+			fmt.Fprintf(os.Stderr, "skipping GitHub/GitLab releases: %v\n", err)
+		}
 		return nil
 	}
 

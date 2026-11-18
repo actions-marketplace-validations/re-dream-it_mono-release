@@ -120,6 +120,9 @@ func Parse(data []byte) (*Config, error) {
 	if c.InitialVersion == "" {
 		c.InitialVersion = "1.0.0"
 	}
+	if err := c.normalizePatterns(); err != nil {
+		return nil, err
+	}
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
@@ -293,6 +296,32 @@ func (c *Config) validateNotes() error {
 		if n.History == "all" && strings.Contains(n.File, "{version}") {
 			return fmt.Errorf("%s: file must not contain {version} when history is all", where)
 		}
+	}
+	return nil
+}
+
+// normalizePatterns cleans the glob patterns of every component so that common spellings work:
+// "./services/orders/**" is the same as "services/orders/**". Patterns are relative to the repository
+// root, so an absolute pattern or one that climbs out of it can never match and is rejected.
+func (c *Config) normalizePatterns() error {
+	for _, name := range c.Names() {
+		comp := c.Components[name]
+		for _, list := range []*[]string{&comp.Paths, &comp.Exclude} {
+			for i, p := range *list {
+				p = strings.TrimSpace(p)
+				for strings.HasPrefix(p, "./") {
+					p = strings.TrimPrefix(p, "./")
+				}
+				if strings.HasPrefix(p, "/") || p == ".." || strings.HasPrefix(p, "../") || strings.Contains(p, "/../") {
+					return fmt.Errorf("component %q: pattern %q must be relative to the repository root", name, (*list)[i])
+				}
+				if p == "" || p == "." {
+					return fmt.Errorf("component %q: empty pattern %q", name, (*list)[i])
+				}
+				(*list)[i] = p
+			}
+		}
+		c.Components[name] = comp
 	}
 	return nil
 }
